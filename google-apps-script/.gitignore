@@ -1,0 +1,4 @@
+# Clasp / Apps Script local artifacts
+.clasprc.json
+node_modules/
+*.log

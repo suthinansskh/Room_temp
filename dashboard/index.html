@@ -1,0 +1,651 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Room Climate Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23111627'/%3E%3Cpath d='M24 12a8 8 0 0 1 16 0v23.2a14 14 0 1 1-16 0V12Z' fill='%2388d1c9'/%3E%3Ccircle cx='32' cy='46' r='8' fill='%23f28c6b'/%3E%3C/svg%3E" />
+<style>
+  :root {
+    --bg: #0f1218;
+    --panel: #171c25;
+    --panel-2: #1d2430;
+    --line: #2b3444;
+    --text: #edf1f5;
+    --muted: #9aa7b7;
+    --soft: #c7d0da;
+    --temp: #f28c6b;
+    --hum: #88d1c9;
+    --ok: #8ed08e;
+    --warn: #f2c96b;
+    --bad: #ef7d7d;
+    --accent: #9fb8ff;
+    --shadow: 0 16px 40px rgba(0,0,0,.24);
+  }
+
+  * { box-sizing: border-box; }
+  html { min-height: 100%; background: var(--bg); }
+  body {
+    min-height: 100%;
+    margin: 0;
+    color: var(--text);
+    background:
+      linear-gradient(180deg, rgba(159,184,255,.08), transparent 320px),
+      var(--bg);
+    font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    letter-spacing: 0;
+  }
+
+  button, input { font: inherit; }
+  button { border: 0; cursor: pointer; }
+  a { color: inherit; }
+
+  .shell {
+    min-height: 100vh;
+    display: grid;
+    grid-template-columns: 280px minmax(0, 1fr);
+  }
+
+  .sidebar {
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    padding: 24px 20px;
+    border-right: 1px solid var(--line);
+    background: rgba(15,18,24,.88);
+    backdrop-filter: blur(12px);
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+  }
+
+  .brand { display: grid; gap: 8px; }
+  .brand-mark {
+    width: 42px;
+    height: 42px;
+    display: grid;
+    place-items: center;
+    border-radius: 8px;
+    background: linear-gradient(135deg, var(--hum), var(--temp));
+    color: #10141b;
+    font-weight: 800;
+  }
+  h1 { margin: 0; font-size: 1.25rem; line-height: 1.15; }
+  .muted { color: var(--muted); }
+  .brand p { margin: 0; font-size: .86rem; line-height: 1.45; }
+
+  .status-stack { display: grid; gap: 10px; }
+  .pill {
+    min-height: 38px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    padding: 8px 10px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel);
+    color: var(--soft);
+    font-size: .86rem;
+  }
+  .pill strong { color: var(--text); font-weight: 650; }
+  .pill.ok strong { color: var(--ok); }
+  .pill.bad strong { color: var(--bad); }
+
+  .settings {
+    margin-top: auto;
+    border-top: 1px solid var(--line);
+    padding-top: 18px;
+  }
+  .settings summary {
+    cursor: pointer;
+    color: var(--soft);
+    font-weight: 650;
+    list-style: none;
+  }
+  .settings summary::-webkit-details-marker { display: none; }
+  .settings summary::after { content: "+"; float: right; color: var(--muted); }
+  .settings[open] summary::after { content: "-"; }
+  .settings-form { display: grid; gap: 10px; margin-top: 14px; }
+  label { display: grid; gap: 5px; color: var(--muted); font-size: .78rem; }
+  input {
+    width: 100%;
+    min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: #10151d;
+    color: var(--text);
+    padding: 9px 10px;
+    outline: none;
+  }
+  input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(159,184,255,.12); }
+  .primary-btn {
+    min-height: 38px;
+    border-radius: 8px;
+    background: var(--accent);
+    color: #0d1320;
+    font-weight: 750;
+  }
+
+  .content { min-width: 0; padding: 26px; }
+  .topbar {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 18px;
+    margin-bottom: 18px;
+  }
+  .eyebrow { margin: 0 0 6px; color: var(--muted); font-size: .78rem; text-transform: uppercase; letter-spacing: .08em; }
+  .topbar h2 { margin: 0; font-size: 1.45rem; line-height: 1.2; }
+  .clock { color: var(--muted); font-size: .88rem; white-space: nowrap; }
+
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(140px, 1fr));
+    gap: 12px;
+    margin-bottom: 18px;
+  }
+  .metric {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(23,28,37,.78);
+    padding: 14px;
+    box-shadow: var(--shadow);
+  }
+  .metric > span { display: block; color: var(--muted); font-size: .78rem; }
+  .metric b span { display: inline; color: inherit; font-size: inherit; }
+  .metric b { display: block; margin-top: 7px; font-size: 1.42rem; line-height: 1; }
+  .metric small { color: var(--muted); font-size: .78rem; }
+
+  .workspace {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 430px;
+    gap: 18px;
+    align-items: start;
+  }
+  .panel {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: rgba(23,28,37,.82);
+    box-shadow: var(--shadow);
+  }
+  .panel-head {
+    min-height: 54px;
+    padding: 14px 16px;
+    border-bottom: 1px solid var(--line);
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+  }
+  .panel-head h3 { margin: 0; font-size: .96rem; }
+  .panel-head span { color: var(--muted); font-size: .82rem; }
+
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(230px, 1fr));
+    gap: 10px;
+    padding: 12px;
+  }
+  .dev {
+    min-height: 160px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--panel-2);
+    color: var(--text);
+    padding: 14px;
+    text-align: left;
+    transition: border-color .15s, transform .15s, background .15s;
+  }
+  .dev:hover { transform: translateY(-1px); border-color: #506074; }
+  .dev.active { border-color: var(--accent); background: #222a38; }
+  .dev.stale { opacity: .72; }
+  .dev.off { opacity: .62; }
+  .dev-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .dev-name { min-width: 0; font-size: .92rem; font-weight: 750; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dot { width: 9px; height: 9px; border-radius: 999px; background: var(--ok); flex: 0 0 auto; }
+  .dev.stale .dot { background: var(--warn); }
+  .dev.off .dot { background: var(--bad); }
+  .values { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin: 18px 0 12px; }
+  .reading span { display: block; color: var(--muted); font-size: .72rem; text-transform: uppercase; letter-spacing: .08em; }
+  .reading b { display: block; margin-top: 4px; font-size: 1.7rem; line-height: 1; }
+  .reading.temp b { color: var(--temp); }
+  .reading.hum b { color: var(--hum); }
+  .dev-meta { display: flex; flex-wrap: wrap; gap: 6px; color: var(--muted); font-size: .74rem; }
+  .tag {
+    max-width: 100%;
+    padding: 4px 7px;
+    border: 1px solid #354154;
+    border-radius: 8px;
+    background: #151b24;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+  .tag.link { color: var(--accent); text-decoration: none; }
+
+  .detail { overflow: hidden; }
+  .detail[hidden] { display: none; }
+  .detail-body { padding: 16px; display: grid; gap: 14px; }
+  .selected-readings { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .selected-readings .metric { box-shadow: none; background: #151b24; }
+  .chart { height: 315px; min-height: 315px; }
+  .detail-grid { display: grid; gap: 8px; }
+  .detail-row {
+    display: flex;
+    justify-content: space-between;
+    gap: 12px;
+    border-bottom: 1px solid rgba(43,52,68,.72);
+    padding-bottom: 8px;
+    color: var(--muted);
+    font-size: .86rem;
+  }
+  .detail-row:last-child { border-bottom: 0; padding-bottom: 0; }
+  .detail-row b { color: var(--text); font-weight: 650; text-align: right; }
+  .ip-link { color: var(--accent); text-decoration: none; }
+
+  footer { padding: 22px 26px 28px; color: var(--muted); font-size: .82rem; }
+  code { background: #151b24; border: 1px solid var(--line); border-radius: 6px; padding: 1px 5px; }
+
+  @media (max-width: 1120px) {
+    .shell { grid-template-columns: 1fr; }
+    .sidebar { position: static; height: auto; }
+    .settings { margin-top: 0; }
+    .settings-form { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .primary-btn { align-self: end; }
+    .workspace { grid-template-columns: 1fr; }
+  }
+
+  @media (max-width: 760px) {
+    .content { padding: 18px 14px; }
+    .sidebar { padding: 18px 14px; }
+    .topbar { align-items: flex-start; flex-direction: column; }
+    .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    .settings-form { grid-template-columns: 1fr; }
+    .grid { grid-template-columns: 1fr; }
+    .selected-readings { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">RT</div>
+      <div>
+        <h1>Room Climate</h1>
+        <p class="muted">Live temperature and humidity telemetry</p>
+      </div>
+    </div>
+
+    <div class="status-stack">
+      <div id="mqttPill" class="pill"><span>MQTT</span><strong>connecting...</strong></div>
+      <div id="countPill" class="pill"><span>Devices</span><strong>0</strong></div>
+    </div>
+
+    <details class="settings">
+      <summary>Settings</summary>
+      <div class="settings-form">
+        <label>HiveMQ host (WSS)<input id="cfgHost" placeholder="REDACTED_HIVEMQ_CLUSTER.s1.eu.hivemq.cloud" value="REDACTED_HIVEMQ_CLUSTER.s1.eu.hivemq.cloud" /></label>
+        <label>Port<input id="cfgPort" value="8884" /></label>
+        <label>Username<input id="cfgUser" value="REDACTED_MQTT_USER" /></label>
+        <label>Password<input id="cfgPass" type="password" value="REDACTED_MQTT_PASS" /></label>
+        <label>Base topic<input id="cfgBase" value="room" /></label>
+        <label>Stale after (seconds)<input id="cfgStale" value="45" /></label>
+        <label>Google Sheets /exec URL<input id="cfgGs" placeholder="https://script.google.com/macros/s/.../exec" /></label>
+        <label>Expected device IDs<input id="cfgDevs" placeholder="room1,room2,room3,room4,room5,room6,room7,room8,room9,room10" /></label>
+        <button id="save" class="primary-btn">Save and reconnect</button>
+      </div>
+    </details>
+  </aside>
+
+  <main class="content">
+    <div class="topbar">
+      <div>
+        <p class="eyebrow">Dashboard</p>
+        <h2>Rooms overview</h2>
+      </div>
+      <div id="clock" class="clock">--</div>
+    </div>
+
+    <section class="metrics" aria-label="Summary">
+      <div class="metric"><span>Online</span><b id="sOnline">0</b><small>active sensors</small></div>
+      <div class="metric"><span>Average temperature</span><b><span id="sTemp">--</span> °C</b><small>online rooms</small></div>
+      <div class="metric"><span>Average humidity</span><b><span id="sHum">--</span> %</b><small>online rooms</small></div>
+      <div class="metric"><span>Temperature range</span><b id="sMinMax">--</b><small>min / max</small></div>
+    </section>
+
+    <div class="workspace">
+      <section class="panel">
+        <div class="panel-head">
+          <h3>Devices</h3>
+          <span id="deviceHint">Waiting for MQTT data</span>
+        </div>
+        <div id="grid" class="grid"></div>
+      </section>
+
+      <section class="panel detail" id="detail" hidden>
+        <div class="panel-head">
+          <h3 id="detailTitle">Device</h3>
+          <span id="detailStatus">--</span>
+        </div>
+        <div class="detail-body">
+          <div class="selected-readings">
+            <div class="metric"><span>Temperature</span><b><span id="dTemp">--</span> °C</b></div>
+            <div class="metric"><span>Humidity</span><b><span id="dHum">--</span> %</b></div>
+          </div>
+          <div class="chart"><canvas id="chart"></canvas></div>
+          <div class="detail-grid">
+            <div class="detail-row"><span>IP address</span><b id="dIp">--</b></div>
+            <div class="detail-row"><span>RSSI</span><b id="dRssi">--</b></div>
+            <div class="detail-row"><span>Uptime</span><b id="dUptime">--</b></div>
+            <div class="detail-row"><span>Last update</span><b id="dLast">--</b></div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<footer>
+  Static dashboard subscribed to <code>&lt;base&gt;/+</code> and <code>&lt;base&gt;/+/status</code> on HiveMQ Cloud.
+</footer>
+
+<script src="https://unpkg.com/mqtt@5.3.4/dist/mqtt.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+const cfgKeys = ['cfgHost','cfgPort','cfgUser','cfgPass','cfgBase','cfgStale','cfgGs','cfgDevs'];
+const cfg = {};
+
+cfgKeys.forEach(k => {
+  const value = localStorage.getItem(k);
+  if (value !== null) $(k).value = value;
+  cfg[k] = $(k).value;
+});
+
+$('save').onclick = () => {
+  cfgKeys.forEach(k => {
+    cfg[k] = $(k).value.trim();
+    localStorage.setItem(k, cfg[k]);
+  });
+  if (client) try { client.end(true); } catch (e) {}
+  devices = {};
+  activeId = null;
+  $('grid').innerHTML = '';
+  $('detail').hidden = true;
+  seedExpected();
+  refreshStaleness();
+  connect();
+};
+
+let devices = {};
+let activeId = null;
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>'"]/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;' }[char]));
+}
+
+function blankDevice(id) {
+  return { id, temp:NaN, hum:NaN, rssi:null, uptime:null, ip:null, lastTs:0, status:'unknown', history:[] };
+}
+
+function seedExpected() {
+  if (!cfg.cfgDevs) return;
+  cfg.cfgDevs.split(',').map(s => s.trim()).filter(Boolean).forEach(id => {
+    if (!devices[id]) devices[id] = blankDevice(id);
+    renderCard(id);
+  });
+}
+
+function fmtAge(ts) {
+  if (!ts) return 'no data';
+  const seconds = Math.max(0, Math.round((Date.now() - ts) / 1000));
+  if (seconds < 60) return seconds + 's ago';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return minutes + 'm ago';
+  return Math.round(minutes / 60) + 'h ago';
+}
+
+function fmtUptime(seconds) {
+  if (seconds == null || isNaN(seconds)) return '--';
+  const mins = Math.floor(seconds / 60);
+  const hrs = Math.floor(mins / 60);
+  const days = Math.floor(hrs / 24);
+  if (days > 0) return `${days}d ${hrs % 24}h`;
+  if (hrs > 0) return `${hrs}h ${mins % 60}m`;
+  return `${mins}m`;
+}
+
+function statusText(status) {
+  if (status === 'online') return 'online';
+  if (status === 'stale') return 'stale';
+  if (status === 'offline') return 'offline';
+  return 'unknown';
+}
+
+function cleanDeviceId(id) {
+  return String(id).replace(/[^A-Za-z0-9_.-]/g, '').trim();
+}
+
+function findCard(id) {
+  const nodes = document.querySelectorAll('.dev');
+  return Array.from(nodes).find(el => el.dataset.id === id);
+}
+
+function setActive(id) {
+  activeId = id;
+  document.querySelectorAll('.dev').forEach(el => el.classList.toggle('active', el.dataset.id === id));
+  $('detail').hidden = false;
+  updateDetail();
+  redrawChart();
+  loadHistory(id);
+}
+
+function renderCard(id) {
+  const d = devices[id];
+  let el = findCard(id);
+  if (!el) {
+    el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'dev';
+    el.dataset.id = id;
+    el.onclick = () => setActive(id);
+    $('grid').appendChild(el);
+  }
+  const name = escapeHtml(id);
+  const tStr = isNaN(d.temp) ? '--.-' : d.temp.toFixed(1);
+  const hStr = isNaN(d.hum) ? '--' : Math.round(d.hum);
+  const ipStr = d.ip ? `<a class="tag link" href="http://${escapeHtml(d.ip)}/" target="_blank" rel="noopener" onclick="event.stopPropagation()">${escapeHtml(d.ip)}</a>` : '';
+  el.innerHTML = `
+    <div class="dev-top"><span class="dev-name">${name}</span><span class="dot"></span></div>
+    <div class="values">
+      <div class="reading temp"><span>Temp</span><b>${tStr}<small>°C</small></b></div>
+      <div class="reading hum"><span>Hum</span><b>${hStr}<small>%</small></b></div>
+    </div>
+    <div class="dev-meta">
+      <span class="tag">${statusText(d.status)}</span>
+      <span class="tag">${fmtAge(d.lastTs)}</span>
+      ${d.rssi != null ? `<span class="tag">${escapeHtml(d.rssi)} dBm</span>` : ''}
+      ${ipStr}
+    </div>
+  `;
+  el.classList.toggle('stale', d.status === 'stale');
+  el.classList.toggle('off', d.status === 'offline');
+  el.classList.toggle('active', activeId === id);
+}
+
+function updateDetail() {
+  const d = devices[activeId];
+  if (!d) return;
+  $('detailTitle').textContent = d.id;
+  $('detailStatus').textContent = statusText(d.status);
+  $('dTemp').textContent = isNaN(d.temp) ? '--' : d.temp.toFixed(1);
+  $('dHum').textContent = isNaN(d.hum) ? '--' : Math.round(d.hum);
+  $('dIp').innerHTML = d.ip ? `<a class="ip-link" href="http://${escapeHtml(d.ip)}/" target="_blank" rel="noopener">${escapeHtml(d.ip)}</a>` : '--';
+  $('dRssi').textContent = d.rssi != null ? d.rssi + ' dBm' : '--';
+  $('dUptime').textContent = fmtUptime(d.uptime);
+  $('dLast').textContent = fmtAge(d.lastTs);
+}
+
+function refreshStaleness() {
+  const staleSec = Math.max(5, parseInt(cfg.cfgStale || '45', 10));
+  let online = 0, ts = [], hs = [];
+  Object.values(devices).forEach(d => {
+    if (d.status !== 'offline') {
+      if (!d.lastTs) d.status = 'unknown';
+      else d.status = ((Date.now() - d.lastTs) / 1000) > staleSec ? 'stale' : 'online';
+    }
+    if (d.status === 'online') {
+      online++;
+      if (!isNaN(d.temp)) ts.push(d.temp);
+      if (!isNaN(d.hum)) hs.push(d.hum);
+    }
+    renderCard(d.id);
+  });
+  const total = Object.keys(devices).length;
+  $('countPill').innerHTML = `<span>Devices</span><strong>${total}</strong>`;
+  $('deviceHint').textContent = total ? `${total} configured or discovered` : 'Waiting for MQTT data';
+  $('sOnline').textContent = online;
+  const avg = a => a.length ? (a.reduce((x, y) => x + y, 0) / a.length).toFixed(1) : '--';
+  $('sTemp').textContent = avg(ts);
+  $('sHum').textContent = avg(hs);
+  $('sMinMax').textContent = ts.length ? `${Math.min(...ts).toFixed(1)} / ${Math.max(...ts).toFixed(1)} °C` : '--';
+  if (activeId) updateDetail();
+}
+setInterval(refreshStaleness, 2000);
+
+setInterval(() => {
+  $('clock').textContent = new Date().toLocaleString([], { dateStyle:'medium', timeStyle:'medium' });
+}, 1000);
+$('clock').textContent = new Date().toLocaleString([], { dateStyle:'medium', timeStyle:'medium' });
+
+const chart = new Chart($('chart').getContext('2d'), {
+  type: 'line',
+  data: { labels: [], datasets: [
+    { label:'Temp (°C)', data:[], borderColor:'#f28c6b', backgroundColor:'rgba(242,140,107,.12)', pointRadius:0, borderWidth:2, tension:.28, yAxisID:'y' },
+    { label:'Humidity (%)', data:[], borderColor:'#88d1c9', backgroundColor:'rgba(136,209,201,.12)', pointRadius:0, borderWidth:2, tension:.28, yAxisID:'y1' },
+  ]},
+  options: {
+    responsive:true,
+    maintainAspectRatio:false,
+    animation:false,
+    interaction:{ intersect:false, mode:'index' },
+    scales: {
+      x:{ ticks:{color:'#9aa7b7', maxTicksLimit:6}, grid:{color:'rgba(43,52,68,.7)'} },
+      y:{ position:'left', ticks:{color:'#f28c6b'}, grid:{color:'rgba(43,52,68,.7)'}, title:{display:true,text:'°C',color:'#f28c6b'} },
+      y1:{ position:'right', ticks:{color:'#88d1c9'}, grid:{display:false}, title:{display:true,text:'%',color:'#88d1c9'} },
+    },
+    plugins:{ legend:{ labels:{ color:'#edf1f5', boxWidth:10, boxHeight:10 } } }
+  }
+});
+
+function redrawChart() {
+  const d = devices[activeId];
+  if (!d) return;
+  chart.data.labels = d.history.map(p => new Date(p.t).toLocaleTimeString());
+  chart.data.datasets[0].data = d.history.map(p => p.T);
+  chart.data.datasets[1].data = d.history.map(p => p.H);
+  chart.update();
+}
+
+function pushHistory(d, t, T, H) {
+  d.history.push({ t, T, H });
+  if (d.history.length > 300) d.history.shift();
+  if (activeId === d.id) {
+    chart.data.labels.push(new Date(t).toLocaleTimeString());
+    chart.data.datasets[0].data.push(T);
+    chart.data.datasets[1].data.push(H);
+    if (chart.data.labels.length > 300) {
+      chart.data.labels.shift();
+      chart.data.datasets.forEach(s => s.data.shift());
+    }
+    chart.update();
+  }
+}
+
+let client = null;
+function setMqttPill(text, cls) {
+  const p = $('mqttPill');
+  p.innerHTML = `<span>MQTT</span><strong>${escapeHtml(text)}</strong>`;
+  p.classList.remove('ok','bad');
+  if (cls) p.classList.add(cls);
+}
+
+function connect() {
+  if (!cfg.cfgHost) { setMqttPill('configure host', 'bad'); return; }
+  const url = `wss://${cfg.cfgHost}:${cfg.cfgPort || 8884}/mqtt`;
+  setMqttPill('connecting...');
+  client = mqtt.connect(url, {
+    username: cfg.cfgUser,
+    password: cfg.cfgPass,
+    clientId: 'dash-' + Math.random().toString(16).slice(2, 10),
+    clean: true,
+    reconnectPeriod: 4000,
+  });
+  const base = cfg.cfgBase || 'room';
+  client.on('connect', () => {
+    setMqttPill('connected', 'ok');
+    client.subscribe(`${base}/+`);
+    client.subscribe(`${base}/+/status`);
+  });
+  client.on('reconnect', () => setMqttPill('reconnecting...'));
+  client.on('error', e => { setMqttPill('error', 'bad'); console.error(e); });
+  client.on('close', () => setMqttPill('disconnected', 'bad'));
+  client.on('message', (topic, payload) => {
+    const parts = topic.split('/');
+    if (parts[0] !== base) return;
+    const id = cleanDeviceId(parts[1]);
+    if (!id) return;
+    if (!devices[id]) devices[id] = blankDevice(id);
+    const d = devices[id];
+
+    if (parts[2] === 'status') {
+      const state = payload.toString();
+      d.status = (state === 'online') ? 'online' : 'offline';
+      renderCard(id);
+      if (activeId === id) updateDetail();
+      refreshStaleness();
+      return;
+    }
+    try {
+      const data = JSON.parse(payload.toString());
+      const ts = Date.now();
+      d.temp = +data.temp;
+      d.hum = +data.hum;
+      d.rssi = data.rssi ?? null;
+      d.uptime = data.uptime ?? null;
+      if (data.ip) d.ip = data.ip;
+      d.lastTs = ts;
+      d.status = 'online';
+      pushHistory(d, ts, d.temp, d.hum);
+      renderCard(id);
+      refreshStaleness();
+      if (!activeId) setActive(id);
+      else if (activeId === id) updateDetail();
+    } catch (e) {
+      console.warn('bad payload from', topic, e);
+    }
+  });
+}
+
+async function loadHistory(id) {
+  if (!cfg.cfgGs) return;
+  try {
+    const r = await fetch(`${cfg.cfgGs}?action=history&device=${encodeURIComponent(id)}&n=200`);
+    const arr = await r.json();
+    if (!Array.isArray(arr)) return;
+    const d = devices[id] || (devices[id] = blankDevice(id));
+    d.history = arr.map(row => ({ t: new Date(row.ts).getTime(), T: +row.temp, H: +row.hum }));
+    if (activeId === id) redrawChart();
+  } catch (e) {
+    console.warn('history fetch failed', e);
+  }
+}
+
+seedExpected();
+refreshStaleness();
+connect();
+</script>
+</body>
+</html>

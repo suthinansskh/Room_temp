@@ -1,0 +1,26 @@
+# Build artifacts
+build/
+*.bin
+*.elf
+
+# PlatformIO
+.pio/
+.pioenvs/
+.piolibdeps/
+.vscode/ipch/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+
+# Secrets
+secrets.h
+*.local
+
+# clasp credentials (never commit!)
+.clasprc.json
+**/.clasprc.json
