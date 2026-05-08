@@ -286,10 +286,10 @@
     <details class="settings">
       <summary>Settings</summary>
       <div class="settings-form">
-        <label>HiveMQ host (WSS)<input id="cfgHost" placeholder="REDACTED_HIVEMQ_CLUSTER.s1.eu.hivemq.cloud" value="REDACTED_HIVEMQ_CLUSTER.s1.eu.hivemq.cloud" /></label>
+        <label>HiveMQ host (WSS)<input id="cfgHost" placeholder="your-cluster.s1.eu.hivemq.cloud" /></label>
         <label>Port<input id="cfgPort" value="8884" /></label>
-        <label>Username<input id="cfgUser" value="REDACTED_MQTT_USER" /></label>
-        <label>Password<input id="cfgPass" type="password" value="REDACTED_MQTT_PASS" /></label>
+        <label>Username<input id="cfgUser" placeholder="subscribe-only MQTT user" /></label>
+        <label>Password<input id="cfgPass" type="password" placeholder="MQTT password" /></label>
         <label>Base topic<input id="cfgBase" value="room" /></label>
         <label>Stale after (seconds)<input id="cfgStale" value="45" /></label>
         <label>Google Sheets /exec URL<input id="cfgGs" placeholder="https://script.google.com/macros/s/.../exec" /></label>
@@ -357,6 +357,27 @@
 const $ = id => document.getElementById(id);
 const cfgKeys = ['cfgHost','cfgPort','cfgUser','cfgPass','cfgBase','cfgStale','cfgGs','cfgDevs'];
 const cfg = {};
+
+// Bootstrap config from URL hash on first load (e.g.
+//   index.html#host=cluster.hivemq.cloud&user=dash_sub&pass=xxx&devs=room1,room2
+// ). Values are saved to localStorage and the hash is stripped so creds
+// don't linger in browser history. Useful for bookmarking subscribe-only
+// creds without committing them to source.
+(function applyHashConfig() {
+  if (!location.hash) return;
+  const map = { host:'cfgHost', port:'cfgPort', user:'cfgUser', pass:'cfgPass',
+                base:'cfgBase', stale:'cfgStale', gs:'cfgGs', devs:'cfgDevs' };
+  let touched = false;
+  location.hash.slice(1).split('&').forEach(pair => {
+    const [k, v] = pair.split('=');
+    const key = map[k];
+    if (key && v !== undefined) {
+      localStorage.setItem(key, decodeURIComponent(v));
+      touched = true;
+    }
+  });
+  if (touched) history.replaceState(null, '', location.pathname + location.search);
+})();
 
 cfgKeys.forEach(k => {
   const value = localStorage.getItem(k);
@@ -515,16 +536,6 @@ function refreshStaleness() {
     if (d.status !== 'offline') {
       if (!d.lastTs) d.status = 'unknown';
       else d.status = ((Date.now() - d.lastTs) / 1000) > staleSec ? 'stale' : 'online';
-    }
-    if (d.expected && !d.lastTs) {
-      const card = findCard(d.id);
-      if (card) card.remove();
-      delete devices[d.id];
-      if (activeId === d.id) {
-        activeId = null;
-        $('detail').hidden = true;
-      }
-      return;
     }
     if (d.status === 'online') {
       online++;

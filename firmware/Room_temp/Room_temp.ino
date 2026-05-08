@@ -135,7 +135,7 @@ unsigned long lastReconnMs = 0;
 
 const unsigned long READ_INTERVAL  = 2000;     // 2s
 const unsigned long PUB_INTERVAL   = 10000;    // 10s MQTT
-const unsigned long SHEET_INTERVAL = 3600000UL; // 60 min Google Sheets
+const unsigned long SHEET_INTERVAL = 300000UL;  // 5 min Google Sheets (debug-friendly)
 
 // ---------------- OLED helpers ----------------
 void oledMsg(const String& l1, const String& l2 = "", const String& l3 = "") {
@@ -268,26 +268,63 @@ void publishMQTT(float t, float h) {
 }
 
 // ---------------- Google Sheets ----------------
+// Apps Script /exec returns a 302 redirect to script.googleusercontent.com.
+// ESP8266HTTPClient won't re-POST across hosts (and HTTPC_FORCE_FOLLOW would
+// downgrade to GET, losing the body), so we follow redirects manually and
+// re-POST the same JSON to each hop.
 void postToSheet(float t, float h) {
-  WiFiClientSecure client;
-  client.setInsecure();
-  HTTPClient https;
-  String url = String("https://") + gs_host + gs_path;
-  if (!https.begin(client, url)) { Serial.println("GS begin fail"); return; }
-  https.addHeader("Content-Type", "application/json");
-  https.setFollowRedirects(HTTPC_STRICT_FOLLOW_REDIRECTS);
-
   StaticJsonDocument<256> doc;
   doc["project"] = project_id;
-  doc["device"] = device_id;
-  doc["temp"]   = t;
-  doc["hum"]    = h;
-  doc["rssi"]   = WiFi.RSSI();
+  doc["device"]  = device_id;
+  doc["temp"]    = t;
+  doc["hum"]     = h;
+  doc["rssi"]    = WiFi.RSSI();
+  doc["ip"]      = WiFi.localIP().toString();
+  doc["uptime"]  = (uint32_t)(millis() / 1000);
   String body; serializeJson(doc, body);
 
-  int code = https.POST(body);
-  Serial.printf("GS POST %d\n", code);
-  https.end();
+  String host = gs_host;
+  String path = gs_path;
+
+  for (int hop = 0; hop < 4; hop++) {
+    WiFiClientSecure client;
+    client.setInsecure();
+    client.setBufferSizes(4096, 512);  // share TLS heap with the MQTT client
+
+    HTTPClient https;
+    String url = String("https://") + host + path;
+    if (!https.begin(client, url)) {
+      Serial.printf("GS begin fail (hop %d) %s\n", hop, url.c_str());
+      return;
+    }
+    https.addHeader("Content-Type", "application/json");
+    const char* collect[] = { "Location" };
+    https.collectHeaders(collect, 1);
+
+    int code = https.POST(body);
+    Serial.printf("GS POST %d (hop %d) %s%s\n", code, hop, host.c_str(), path.c_str());
+
+    if (code == 301 || code == 302 || code == 303 || code == 307 || code == 308) {
+      String loc = https.header("Location");
+      https.end();
+      if (!loc.startsWith("https://")) {
+        Serial.printf("GS redirect not https: '%s'\n", loc.c_str());
+        return;
+      }
+      int slash = loc.indexOf('/', 8);
+      if (slash < 0) { Serial.println("GS redirect URL has no path"); return; }
+      host = loc.substring(8, slash);
+      path = loc.substring(slash);
+      continue;
+    }
+
+    if (code > 0 && code < 400) {
+      Serial.printf("GS body: %s\n", https.getString().c_str());
+    }
+    https.end();
+    return;
+  }
+  Serial.println("GS too many redirects");
 }
 
 // ---------------- Web Server ----------------
@@ -461,7 +498,8 @@ void loop() {
     publishMQTT(lastTemp, lastHum);
   }
 
-  if (!isnan(lastTemp) && now - lastSheetMs > SHEET_INTERVAL) {
+  // First valid reading triggers an immediate POST; thereafter every SHEET_INTERVAL.
+  if (!isnan(lastTemp) && (lastSheetMs == 0 || now - lastSheetMs > SHEET_INTERVAL)) {
     lastSheetMs = now;
     postToSheet(lastTemp, lastHum);
   }

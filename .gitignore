@@ -24,3 +24,7 @@ secrets.h
 # clasp credentials (never commit!)
 .clasprc.json
 **/.clasprc.json
+
+# Local backups (never commit!)
+.git.backup-*/
+replacements.txt
