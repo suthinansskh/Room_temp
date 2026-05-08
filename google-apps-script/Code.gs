@@ -21,6 +21,9 @@
  *   GET /exec?project=room_temp&action=latest  [&device=room1]
  *   GET /exec?project=room_temp&action=history [&device=room1&n=100]
  *   GET /exec?project=room_temp&action=summary           (latest per device)
+ *   GET /exec?project=room_temp&action=report_daily      (refresh daily report)
+ *   GET /exec?project=room_temp&action=report_monthly    (refresh monthly report)
+ *   GET /exec?project=room_temp&action=refresh_reports   (refresh both reports)
  *   GET /exec?action=projects                            (list of tabs)
  *
  * SETUP:
@@ -33,6 +36,8 @@
 
 const SHEET_ID        = '1nYyChrB_bBy2wSPH3w4wVxHWwKy7d3gQhFDK23xHZB8';
 const DEFAULT_PROJECT = 'room_temp';
+const DAILY_REPORT_SUFFIX = '_daily_report';
+const MONTHLY_REPORT_SUFFIX = '_monthly_report';
 
 // --- internals ---------------------------------------------------------
 
@@ -101,6 +106,15 @@ function doGet(e) {
   if (action === 'projects') {
     return _json(_ss().getSheets().map(s => s.getName()));
   }
+  if (action === 'report_daily') {
+    return _json(refreshDailyReport(project));
+  }
+  if (action === 'report_monthly') {
+    return _json(refreshMonthlyReport(project));
+  }
+  if (action === 'refresh_reports') {
+    return _json(refreshReports(project));
+  }
 
   const sh = _getOrCreateSheet(project);
   const values = sh.getDataRange().getValues();
@@ -134,4 +148,212 @@ function _json(obj) {
   return ContentService
     .createTextOutput(JSON.stringify(obj))
     .setMimeType(ContentService.MimeType.JSON);
+}
+
+// --- Daily / monthly reports -----------------------------------------
+
+function refreshReports(project) {
+  const projectName = project || DEFAULT_PROJECT;
+  return {
+    ok: true,
+    project: projectName,
+    daily: refreshDailyReport(projectName),
+    monthly: refreshMonthlyReport(projectName),
+  };
+}
+
+function refreshDailyReports() {
+  return refreshReports(DEFAULT_PROJECT);
+}
+
+function refreshMonthlyReports() {
+  return refreshMonthlyReport(DEFAULT_PROJECT);
+}
+
+function refreshDailyReport(project) {
+  const projectName = project || DEFAULT_PROJECT;
+  const rows = _buildReportRows(projectName, 'day');
+  const sheetName = _sanitize(projectName + DAILY_REPORT_SUFFIX);
+  _writeReportSheet(sheetName, rows);
+  return { ok: true, sheet: sheetName, rows: rows.length };
+}
+
+function refreshMonthlyReport(project) {
+  const projectName = project || DEFAULT_PROJECT;
+  const rows = _buildReportRows(projectName, 'month');
+  const sheetName = _sanitize(projectName + MONTHLY_REPORT_SUFFIX);
+  _writeReportSheet(sheetName, rows);
+  return { ok: true, sheet: sheetName, rows: rows.length };
+}
+
+function setupReportTriggers() {
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    const handler = trigger.getHandlerFunction();
+    if (handler === 'refreshDailyReports' || handler === 'refreshMonthlyReports') {
+      ScriptApp.deleteTrigger(trigger);
+    }
+  });
+
+  ScriptApp.newTrigger('refreshDailyReports')
+    .timeBased()
+    .everyDays(1)
+    .atHour(0)
+    .create();
+
+  ScriptApp.newTrigger('refreshMonthlyReports')
+    .timeBased()
+    .onMonthDay(1)
+    .atHour(1)
+    .create();
+
+  return { ok: true, daily: '00:00', monthly: 'day 1 01:00', timezone: Session.getScriptTimeZone() };
+}
+
+function _buildReportRows(project, periodType) {
+  const data = _readProjectRecords(project);
+  const timezone = Session.getScriptTimeZone();
+  const groups = {};
+
+  data.forEach(record => {
+    const date = _asDate(record.ts);
+    if (!date) return;
+    const device = String(record.device || '').trim() || '(unknown)';
+    const period = Utilities.formatDate(date, timezone, periodType === 'month' ? 'yyyy-MM' : 'yyyy-MM-dd');
+    const key = period + '\u0001' + device;
+    if (!groups[key]) {
+      groups[key] = {
+        period,
+        device,
+        count: 0,
+        temps: [],
+        hums: [],
+        rssis: [],
+        lastSeen: null,
+        lastTemp: '',
+        lastHum: '',
+        lastIp: '',
+        lastUptime: '',
+      };
+    }
+    const group = groups[key];
+    group.count++;
+    _pushNumber(group.temps, record.temp);
+    _pushNumber(group.hums, record.hum);
+    _pushNumber(group.rssis, record.rssi);
+    if (!group.lastSeen || date.getTime() >= group.lastSeen.getTime()) {
+      group.lastSeen = date;
+      group.lastTemp = _numberOrBlank(record.temp);
+      group.lastHum = _numberOrBlank(record.hum);
+      group.lastIp = record.ip || '';
+      group.lastUptime = _numberOrBlank(record.uptime);
+    }
+  });
+
+  return Object.values(groups)
+    .sort((a, b) => a.period === b.period ? a.device.localeCompare(b.device) : a.period.localeCompare(b.period))
+    .map(group => [
+      group.period,
+      group.device,
+      group.count,
+      _avg(group.temps),
+      _min(group.temps),
+      _max(group.temps),
+      _avg(group.hums),
+      _min(group.hums),
+      _max(group.hums),
+      _avg(group.rssis),
+      group.lastTemp,
+      group.lastHum,
+      group.lastSeen ? group.lastSeen : '',
+      group.lastIp,
+      group.lastUptime,
+    ]);
+}
+
+function _readProjectRecords(project) {
+  const sh = _getOrCreateSheet(project);
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return [];
+  const header = values[0].map(String);
+  return values.slice(1).map(row => {
+    const record = {};
+    header.forEach((key, index) => { record[key] = row[index]; });
+    return record;
+  });
+}
+
+function _writeReportSheet(sheetName, rows) {
+  const ss = _ss();
+  let sh = ss.getSheetByName(sheetName);
+  if (!sh) sh = ss.insertSheet(sheetName);
+  sh.clearContents();
+  const header = [
+    'period', 'device', 'count',
+    'avg_temp', 'min_temp', 'max_temp',
+    'avg_hum', 'min_hum', 'max_hum',
+    'avg_rssi', 'last_temp', 'last_hum', 'last_seen', 'last_ip', 'last_uptime'
+  ];
+  sh.getRange(1, 1, 1, header.length).setValues([header]);
+  if (rows.length) sh.getRange(2, 1, rows.length, header.length).setValues(rows);
+  sh.setFrozenRows(1);
+  sh.autoResizeColumns(1, header.length);
+}
+
+function _asDate(value) {
+  if (value instanceof Date && !isNaN(value.getTime())) return value;
+  const date = new Date(value);
+  return isNaN(date.getTime()) ? null : date;
+}
+
+function _pushNumber(values, value) {
+  const num = Number(value);
+  if (!isNaN(num)) values.push(num);
+}
+
+function _numberOrBlank(value) {
+  const num = Number(value);
+  return isNaN(num) ? '' : num;
+}
+
+function _avg(values) {
+  if (!values.length) return '';
+  return Math.round((values.reduce((sum, value) => sum + value, 0) / values.length) * 100) / 100;
+}
+
+function _min(values) { return values.length ? Math.min.apply(null, values) : ''; }
+function _max(values) { return values.length ? Math.max.apply(null, values) : ''; }
+
+// Diagnostic helpers for `clasp run`.
+function checkProjects() {
+  return _ss().getSheets().map(s => s.getName());
+}
+
+function checkRoomTempSummary() {
+  const sh = _getOrCreateSheet(DEFAULT_PROJECT);
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return [];
+  const header = values[0].map(String);
+  const latest = {};
+  values.slice(1).forEach(row => {
+    const record = {};
+    header.forEach((key, index) => { record[key] = row[index]; });
+    latest[record.device || ''] = record;
+  });
+  return Object.values(latest);
+}
+
+function checkRoom1History() {
+  const sh = _getOrCreateSheet(DEFAULT_PROJECT);
+  const values = sh.getDataRange().getValues();
+  if (values.length < 2) return [];
+  const header = values[0].map(String);
+  const idxDevice = header.indexOf('device');
+  return values.slice(1)
+    .filter(row => idxDevice >= 0 && row[idxDevice] === 'room1')
+    .slice(-5)
+    .map(row => {
+      const record = {};
+      header.forEach((key, index) => { record[key] = row[index]; });
+      return record;
+    });
 }
