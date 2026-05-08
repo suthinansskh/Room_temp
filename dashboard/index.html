@@ -293,7 +293,7 @@
         <label>Base topic<input id="cfgBase" value="room" /></label>
         <label>Stale after (seconds)<input id="cfgStale" value="45" /></label>
         <label>Google Sheets /exec URL<input id="cfgGs" placeholder="https://script.google.com/macros/s/.../exec" /></label>
-        <label>Expected device IDs<input id="cfgDevs" placeholder="room1,room2,room3,room4,room5,room6,room7,room8,room9,room10" /></label>
+        <label>Visible device IDs<input id="cfgDevs" placeholder="Drug_OPD1" /></label>
         <button id="save" class="primary-btn">Save and reconnect</button>
       </div>
     </details>
@@ -386,14 +386,15 @@ function escapeHtml(value) {
   return String(value).replace(/[&<>'"]/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;' }[char]));
 }
 
-function blankDevice(id) {
-  return { id, temp:NaN, hum:NaN, rssi:null, uptime:null, ip:null, lastTs:0, status:'unknown', history:[] };
+function blankDevice(id, expected = false) {
+  return { id, expected, temp:NaN, hum:NaN, rssi:null, uptime:null, ip:null, lastTs:0, status:'unknown', history:[] };
 }
 
 function seedExpected() {
   if (!cfg.cfgDevs) return;
-  cfg.cfgDevs.split(',').map(s => s.trim()).filter(Boolean).forEach(id => {
-    if (!devices[id]) devices[id] = blankDevice(id);
+  cfg.cfgDevs.split(',').map(cleanDeviceId).filter(Boolean).forEach(id => {
+    if (!devices[id]) devices[id] = blankDevice(id, true);
+    else devices[id].expected = true;
     renderCard(id);
   });
 }
@@ -426,6 +427,15 @@ function statusText(status) {
 
 function cleanDeviceId(id) {
   return String(id).replace(/[^A-Za-z0-9_.-]/g, '').trim();
+}
+
+function visibleDeviceIds() {
+  return new Set((cfg.cfgDevs || '').split(',').map(cleanDeviceId).filter(Boolean));
+}
+
+function shouldShowDevice(id) {
+  const visible = visibleDeviceIds();
+  return !visible.size || visible.has(id);
 }
 
 function findCard(id) {
@@ -492,9 +502,29 @@ function refreshStaleness() {
   const staleSec = Math.max(5, parseInt(cfg.cfgStale || '45', 10));
   let online = 0, ts = [], hs = [];
   Object.values(devices).forEach(d => {
+    if (!shouldShowDevice(d.id)) {
+      const card = findCard(d.id);
+      if (card) card.remove();
+      delete devices[d.id];
+      if (activeId === d.id) {
+        activeId = null;
+        $('detail').hidden = true;
+      }
+      return;
+    }
     if (d.status !== 'offline') {
       if (!d.lastTs) d.status = 'unknown';
       else d.status = ((Date.now() - d.lastTs) / 1000) > staleSec ? 'stale' : 'online';
+    }
+    if (d.expected && !d.lastTs) {
+      const card = findCard(d.id);
+      if (card) card.remove();
+      delete devices[d.id];
+      if (activeId === d.id) {
+        activeId = null;
+        $('detail').hidden = true;
+      }
+      return;
     }
     if (d.status === 'online') {
       online++;
@@ -597,6 +627,7 @@ function connect() {
     if (parts[0] !== base) return;
     const id = cleanDeviceId(parts[1]);
     if (!id) return;
+    if (!shouldShowDevice(id)) return;
     if (!devices[id]) devices[id] = blankDevice(id);
     const d = devices[id];
 
