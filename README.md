@@ -60,7 +60,7 @@ Pins are referenced by **GPIO number**, so the same sketch runs on a bare ESP-12
 | 3V3 / GND  | —     | — |
 
 ### Bare ESP-12E module wiring
-
+   
 If you are flashing a **raw ESP-12E** (not a dev board), you also need the standard boot-strap resistors and a USB-TTL adapter:
 
 | ESP-12E pin | Connect to |
