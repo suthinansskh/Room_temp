@@ -202,7 +202,7 @@ bool needWifiWipe   = false;
 
 const unsigned long READ_INTERVAL    = 2000;        // 2s
 const unsigned long PUB_INTERVAL     = 10000;       // 10s MQTT
-const unsigned long SHEET_INTERVAL   = 300000UL;    // 5 min Google Sheets
+const unsigned long SHEET_INTERVAL   = 1800000UL;   // 30 min Google Sheets
 const unsigned long SHIFT_INTERVAL   = 60000UL;     // 1 min OLED Y-shift toggle
 const unsigned long FAULT_REINIT_MS  = 300000UL;    // 5 min NaN → dht.begin()
 const unsigned long FAULT_REBOOT_MS  = 1800000UL;   // 30 min NaN → ESP.restart()
