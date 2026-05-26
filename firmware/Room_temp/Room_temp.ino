@@ -35,6 +35,7 @@
 #include <Adafruit_SSD1306.h>
 #include <ArduinoJson.h>
 #include <EEPROM.h>
+#include <time.h>
 #include "secrets.h"
 
 // ---------------- Pins ----------------
@@ -136,6 +137,14 @@ unsigned long lastReconnMs = 0;
 const unsigned long READ_INTERVAL  = 2000;     // 2s
 const unsigned long PUB_INTERVAL   = 10000;    // 10s MQTT
 const unsigned long SHEET_INTERVAL = 300000UL;  // 5 min Google Sheets (debug-friendly)
+
+// Daily reboot at 08:00 Asia/Bangkok. Guarded by REBOOT_MIN_UPTIME so a boot
+// that lands inside the trigger minute doesn't immediately reboot again.
+const int REBOOT_HOUR = 8;
+const int REBOOT_MINUTE = 0;
+const unsigned long REBOOT_MIN_UPTIME = 60UL * 60UL * 1000UL;  // 1 hour
+const unsigned long REBOOT_CHECK_INTERVAL = 30000UL;           // 30s
+unsigned long lastRebootCheckMs = 0;
 
 // ---------------- OLED helpers ----------------
 void oledMsg(const String& l1, const String& l2 = "", const String& l3 = "") {
@@ -439,6 +448,9 @@ void setup() {
   oledMsg("WiFi OK", WiFi.SSID(), WiFi.localIP().toString());
   Serial.print("IP: "); Serial.println(WiFi.localIP());
 
+  // NTP for the daily reboot trigger. POSIX TZ string for Asia/Bangkok (UTC+7, no DST).
+  configTime("ICT-7", "pool.ntp.org", "time.google.com");
+
   secureClient.setInsecure();
   mqtt.setBufferSize(512);
 
@@ -502,5 +514,19 @@ void loop() {
   if (!isnan(lastTemp) && (lastSheetMs == 0 || now - lastSheetMs > SHEET_INTERVAL)) {
     lastSheetMs = now;
     postToSheet(lastTemp, lastHum);
+  }
+
+  if (now > REBOOT_MIN_UPTIME && now - lastRebootCheckMs > REBOOT_CHECK_INTERVAL) {
+    lastRebootCheckMs = now;
+    time_t ts = time(nullptr);
+    struct tm lt;
+    localtime_r(&ts, &lt);
+    if (lt.tm_year + 1900 >= 2024 &&
+        lt.tm_hour == REBOOT_HOUR && lt.tm_min == REBOOT_MINUTE) {
+      Serial.println("Daily reboot at 08:00 Asia/Bangkok");
+      oledMsg("Daily reboot", "08:00 ICT", "Restarting...");
+      delay(500);
+      ESP.restart();
+    }
   }
 }
