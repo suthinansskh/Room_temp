@@ -1,10 +1,14 @@
 /*
  * Room Temperature Monitor
  * ESP8266 + DHT11 + OLED (SSD1306) + WiFiManager
- *  - HiveMQ Cloud (MQTT over TLS)
+ *  - HiveMQ Cloud (MQTT over TLS) + command channel (<base>/<device>/cmd)
  *  - Google Sheets logging (HTTPS POST to Apps Script Web App)
- *  - Local Web Server (JSON API + simple HTML)
- *  - OLED status display
+ *  - Local Web Server (JSON API + HTML config; Basic-auth on writes)
+ *  - OLED status display with 1-px pixel-shift burn-in protection
+ *  - Per-device temp/hum calibration offsets, persisted in EEPROM
+ *  - DHT11 median-of-5 filter, sanity guard, and sensor watchdog
+ *  - RTC-memory counters + /metrics endpoint
+ *  - GPIO0 runtime: short-press = publish now, long-press 5s = wipe & reboot
  *
  * Libraries (install via Library Manager):
  *   - WiFiManager by tzapu
@@ -35,21 +39,21 @@
 #include <Adafruit_SSD1306.h>
 #include <ArduinoJson.h>
 #include <EEPROM.h>
-#include <time.h>
 #include "secrets.h"
 
+#define FW_VERSION "1.4.0"
+
 // ---------------- Pins ----------------
-// Use raw GPIO numbers so the sketch builds on any ESP8266 variant
-// (NodeMCU, D1 mini, bare ESP-12E module). Mapping:
 //   GPIO2  = D4 (also onboard LED on most dev boards)
 //   GPIO4  = D2 (I2C SDA)
 //   GPIO5  = D1 (I2C SCL)
-//   GPIO0  = D3 / FLASH button (used to force config portal at boot)
-#define DHT_PIN     2     // GPIO2
+//   GPIO0  = D3 / FLASH button — held LOW at boot opens the WiFiManager
+//          portal; at runtime: short press = publish, 5s hold = wipe + reboot
+#define DHT_PIN     2
 #define DHT_TYPE    DHT11
-#define I2C_SDA     4     // GPIO4
-#define I2C_SCL     5     // GPIO5
-#define BOOT_BTN    0     // GPIO0 — held LOW at boot = open WiFiManager portal
+#define I2C_SDA     4
+#define I2C_SCL     5
+#define BOOT_BTN    0
 
 // ---------------- OLED ----------------
 #define OLED_W      128
@@ -58,18 +62,28 @@
 Adafruit_SSD1306 display(OLED_W, OLED_H, &Wire, -1);
 
 // ---------------- Defaults / Config ----------------
-// These can be overridden in the WiFiManager captive portal.
 char mqtt_server[64]   = DEFAULT_MQTT_HOST;
 char mqtt_port_s[6]    = DEFAULT_MQTT_PORT;
 char mqtt_user[40]     = DEFAULT_MQTT_USER;
 char mqtt_pass[40]     = DEFAULT_MQTT_PASS;
-char mqtt_base[40]     = DEFAULT_MQTT_BASE;        // base topic; device publishes to <base>/<device_id>
+char mqtt_base[40]     = DEFAULT_MQTT_BASE;        // topic prefix; device publishes to <base>/<device_id>
 char gs_host[80]       = DEFAULT_GS_HOST;
 char gs_path[140]      = DEFAULT_GS_PATH;
 char project_id[24]    = DEFAULT_PROJECT;
 char device_id[24]     = DEFAULT_DEVICE_ID;
 
-// EEPROM layout: simple struct dump
+// Per-device calibration. Added to raw DHT reading before publish/display.
+// Editable in /config after comparing against a reference thermometer.
+float temp_offset = 0.0f;
+float hum_offset  = 0.0f;
+
+// HTTP basic-auth password for /config, /reset, /metrics. Empty falls back
+// to OTA_PASSWORD so first boot still works without an extra setup step.
+char admin_pass[24] = "";
+const char* ADMIN_USER = "admin";
+
+// EEPROM layout. v2 adds calibration offsets + admin password. v1 magics
+// are migrated forward in place by zero-filling the new fields.
 struct Config {
   uint32_t magic;
   char mqtt_server[64];
@@ -81,14 +95,53 @@ struct Config {
   char gs_path[140];
   char project_id[24];
   char device_id[24];
+  // v2 additions:
+  float temp_offset;
+  float hum_offset;
+  char  admin_pass[24];
 } cfg;
-const uint32_t CFG_MAGIC = 0xC0FFEE05;
+const uint32_t CFG_MAGIC_V1 = 0xC0FFEE05;
+const uint32_t CFG_MAGIC_V2 = 0xC0FFEE06;
+
+// ESP8266 has ~512 B of RTC user memory that survives soft reboots
+// (not power-cycle). Used for boot/reconnect/fault counters so we don't
+// burn flash writes on telemetry that doesn't need to persist forever.
+struct Stats {
+  uint32_t magic;
+  uint32_t boots;
+  uint32_t mqttReconnects;
+  uint32_t sensorFaults;
+};
+const uint32_t STATS_MAGIC = 0x53544154;  // 'STAT'
+Stats stats;
+
+void statsLoad() {
+  ESP.rtcUserMemoryRead(0, (uint32_t*)&stats, sizeof(stats));
+  if (stats.magic != STATS_MAGIC) {
+    stats.magic = STATS_MAGIC;
+    stats.boots = 0;
+    stats.mqttReconnects = 0;
+    stats.sensorFaults = 0;
+  }
+}
+void statsSave() {
+  ESP.rtcUserMemoryWrite(0, (uint32_t*)&stats, sizeof(stats));
+}
+
+void saveConfig();   // forward decl: loadConfig calls saveConfig on v1→v2 migration
 
 void loadConfig() {
   EEPROM.begin(sizeof(Config));
   EEPROM.get(0, cfg);
   EEPROM.end();
-  if (cfg.magic == CFG_MAGIC) {
+  bool migrated = false;
+  if (cfg.magic == CFG_MAGIC_V1) {
+    cfg.temp_offset = 0.0f;
+    cfg.hum_offset  = 0.0f;
+    cfg.admin_pass[0] = '\0';
+    migrated = true;
+  }
+  if (cfg.magic == CFG_MAGIC_V1 || cfg.magic == CFG_MAGIC_V2) {
     strncpy(mqtt_server, cfg.mqtt_server, sizeof(mqtt_server));
     strncpy(mqtt_port_s, cfg.mqtt_port_s, sizeof(mqtt_port_s));
     strncpy(mqtt_user,   cfg.mqtt_user,   sizeof(mqtt_user));
@@ -98,11 +151,15 @@ void loadConfig() {
     strncpy(gs_path,     cfg.gs_path,     sizeof(gs_path));
     strncpy(project_id,  cfg.project_id,  sizeof(project_id));
     strncpy(device_id,   cfg.device_id,   sizeof(device_id));
+    temp_offset = cfg.temp_offset;
+    hum_offset  = cfg.hum_offset;
+    strncpy(admin_pass,  cfg.admin_pass,  sizeof(admin_pass));
   }
+  if (migrated) saveConfig();
 }
 
 void saveConfig() {
-  cfg.magic = CFG_MAGIC;
+  cfg.magic = CFG_MAGIC_V2;
   strncpy(cfg.mqtt_server, mqtt_server, sizeof(cfg.mqtt_server));
   strncpy(cfg.mqtt_port_s, mqtt_port_s, sizeof(cfg.mqtt_port_s));
   strncpy(cfg.mqtt_user,   mqtt_user,   sizeof(cfg.mqtt_user));
@@ -112,6 +169,9 @@ void saveConfig() {
   strncpy(cfg.gs_path,     gs_path,     sizeof(cfg.gs_path));
   strncpy(cfg.project_id,  project_id,  sizeof(cfg.project_id));
   strncpy(cfg.device_id,   device_id,   sizeof(cfg.device_id));
+  cfg.temp_offset = temp_offset;
+  cfg.hum_offset  = hum_offset;
+  strncpy(cfg.admin_pass,  admin_pass,  sizeof(cfg.admin_pass));
   EEPROM.begin(sizeof(Config));
   EEPROM.put(0, cfg);
   EEPROM.commit();
@@ -129,40 +189,48 @@ PubSubClient mqtt(secureClient);
 
 float lastTemp = NAN;
 float lastHum  = NAN;
-unsigned long lastReadMs   = 0;
-unsigned long lastPubMs    = 0;
-unsigned long lastSheetMs  = 0;
-unsigned long lastReconnMs = 0;
+unsigned long lastReadMs      = 0;
+unsigned long lastPubMs       = 0;
+unsigned long lastSheetMs     = 0;
+unsigned long lastReconnMs    = 0;
+unsigned long lastValidReadMs = 0;
+unsigned long lastShiftMs     = 0;
+bool sensorReinited = false;
+bool needPublishNow = false;
+bool needReboot     = false;
+bool needWifiWipe   = false;
 
-const unsigned long READ_INTERVAL  = 2000;     // 2s
-const unsigned long PUB_INTERVAL   = 10000;    // 10s MQTT
-const unsigned long SHEET_INTERVAL = 300000UL;  // 5 min Google Sheets (debug-friendly)
+const unsigned long READ_INTERVAL    = 2000;        // 2s
+const unsigned long PUB_INTERVAL     = 10000;       // 10s MQTT
+const unsigned long SHEET_INTERVAL   = 300000UL;    // 5 min Google Sheets
+const unsigned long SHIFT_INTERVAL   = 60000UL;     // 1 min OLED Y-shift toggle
+const unsigned long FAULT_REINIT_MS  = 300000UL;    // 5 min NaN → dht.begin()
+const unsigned long FAULT_REBOOT_MS  = 1800000UL;   // 30 min NaN → ESP.restart()
 
-// Daily reboot at 08:00 Asia/Bangkok. Guarded by REBOOT_MIN_UPTIME so a boot
-// that lands inside the trigger minute doesn't immediately reboot again.
-const int REBOOT_HOUR = 8;
-const int REBOOT_MINUTE = 0;
-const unsigned long REBOOT_MIN_UPTIME = 60UL * 60UL * 1000UL;  // 1 hour
-const unsigned long REBOOT_CHECK_INTERVAL = 30000UL;           // 30s
-unsigned long lastRebootCheckMs = 0;
+// DHT11 ring buffer for median-of-5 filtering.
+const uint8_t HIST_N = 5;
+float tHist[HIST_N], hHist[HIST_N];
+uint8_t histIdx = 0, histCount = 0;
+
+// Vertical pixel shift for OLED anti-burn. Cycles 0 ↔ 1 once per minute.
+int yShift = 0;
 
 // ---------------- OLED helpers ----------------
 void oledMsg(const String& l1, const String& l2 = "", const String& l3 = "") {
   display.clearDisplay();
   display.setTextSize(1);
   display.setTextColor(SSD1306_WHITE);
-  display.setCursor(0, 0);  display.println(l1);
-  display.setCursor(0, 12); display.println(l2);
-  display.setCursor(0, 24); display.println(l3);
+  display.setCursor(0, yShift);       display.println(l1);
+  display.setCursor(0, 12 + yShift);  display.println(l2);
+  display.setCursor(0, 24 + yShift);  display.println(l3);
   display.display();
 }
 
 void oledData() {
   display.clearDisplay();
   display.setTextColor(SSD1306_WHITE);
-  // Top status line: device id + IP (or MQTT state if no IP yet)
   display.setTextSize(1);
-  display.setCursor(0, 0);
+  display.setCursor(0, yShift);
   display.print(device_id);
   display.print(' ');
   if (WiFi.status() == WL_CONNECTED) {
@@ -170,24 +238,76 @@ void oledData() {
   } else {
     display.print(mqtt.connected() ? "MQTT:OK" : "...");
   }
-
-  // Big temperature on the left
   display.setTextSize(2);
-  display.setCursor(0, 14);
-  if (isnan(lastTemp)) {
-    display.print("--.-");
-  } else {
-    display.print(lastTemp, 1);
-  }
+  display.setCursor(0, 14 + yShift);
+  if (isnan(lastTemp)) display.print("--.-");
+  else                 display.print(lastTemp, 1);
   display.print((char)247);
   display.print('C');
-
-  // Humidity on the right
   display.setTextSize(2);
-  display.setCursor(80, 14);
+  display.setCursor(80, 14 + yShift);
   if (isnan(lastHum)) display.print("--%");
   else { display.print(lastHum, 0); display.print('%'); }
   display.display();
+}
+
+// ---------------- Sensor reading ----------------
+// Small insertion sort on the live samples; returns the middle one.
+float median5(const float* arr, uint8_t n) {
+  float a[HIST_N];
+  for (uint8_t i = 0; i < n; i++) a[i] = arr[i];
+  for (uint8_t i = 1; i < n; i++) {
+    float v = a[i]; int j = i - 1;
+    while (j >= 0 && a[j] > v) { a[j+1] = a[j]; j--; }
+    a[j+1] = v;
+  }
+  return a[n / 2];
+}
+
+// Read DHT once, apply sanity guard + calibration offset, push into the
+// median ring. Returns true if the sample was usable.
+bool readSensorSample() {
+  float t = dht.readTemperature();
+  float h = dht.readHumidity();
+  if (isnan(t) || isnan(h)) return false;
+  if (t < -10.0f || t > 60.0f) return false;
+  if (h < 0.0f   || h > 100.0f) return false;
+  t += temp_offset;
+  h += hum_offset;
+  tHist[histIdx] = t;
+  hHist[histIdx] = h;
+  histIdx = (histIdx + 1) % HIST_N;
+  if (histCount < HIST_N) histCount++;
+  lastTemp = median5(tHist, histCount);
+  lastHum  = median5(hHist, histCount);
+  lastValidReadMs = millis();
+  sensorReinited = false;
+  return true;
+}
+
+// If no valid reading for FAULT_REINIT_MS, re-init the bus and publish a
+// status flag. If still nothing by FAULT_REBOOT_MS, restart.
+void sensorWatchdog() {
+  if (lastValidReadMs == 0) return;
+  unsigned long age = millis() - lastValidReadMs;
+  if (age >= FAULT_REBOOT_MS) {
+    Serial.println("Sensor dead > 30 min, restarting");
+    oledMsg("Sensor fault", "Restarting...");
+    delay(400);
+    ESP.restart();
+  }
+  if (age >= FAULT_REINIT_MS && !sensorReinited) {
+    Serial.println("Sensor NaN > 5 min, re-init dht");
+    stats.sensorFaults++;
+    statsSave();
+    if (mqtt.connected()) {
+      char t[80];
+      snprintf(t, sizeof(t), "%s/%s/status", mqtt_base, device_id);
+      mqtt.publish(t, "sensor_fault", true);
+    }
+    dht.begin();
+    sensorReinited = true;
+  }
 }
 
 // ---------------- Wi-Fi / Portal ----------------
@@ -241,20 +361,57 @@ void startPortal(bool forceConfig) {
 }
 
 // ---------------- MQTT ----------------
+// Commands on <base>/<device>/cmd (retained=false recommended on publisher):
+//   "read"             -> publish a reading immediately
+//   "reboot"           -> ESP.restart() at top of next loop turn
+//   "offset <T> <H>"   -> set calibration offsets (float, float), save, ack
+//   anything else      -> ignored
+void mqttCallback(char* topic, byte* payload, unsigned int len) {
+  char body[48] = {0};
+  size_t n = len < sizeof(body) - 1 ? len : sizeof(body) - 1;
+  memcpy(body, payload, n);
+  Serial.printf("MQTT cmd %s -> %s\n", topic, body);
+
+  if (!strcmp(body, "read")) {
+    needPublishNow = true;
+  } else if (!strcmp(body, "reboot")) {
+    needReboot = true;
+  } else if (!strncmp(body, "offset", 6)) {
+    float t = 0, h = 0;
+    if (sscanf(body + 6, "%f %f", &t, &h) == 2) {
+      temp_offset = t;
+      hum_offset  = h;
+      saveConfig();
+      char ack[64];
+      snprintf(ack, sizeof(ack), "offset t=%.2f h=%.2f", t, h);
+      char st[80];
+      snprintf(st, sizeof(st), "%s/%s/status", mqtt_base, device_id);
+      mqtt.publish(st, ack, true);
+    }
+  }
+}
+
 void mqttConnect() {
   if (mqtt.connected()) return;
   if (millis() - lastReconnMs < 5000) return;
   lastReconnMs = millis();
 
-  secureClient.setInsecure();          // skip cert validation (simple)
   mqtt.setServer(mqtt_server, atoi(mqtt_port_s));
-  String cid = String("esp-") + device_id + "-" + String(ESP.getChipId(), HEX);
-  Serial.printf("MQTT connect to %s:%s as %s ...\n", mqtt_server, mqtt_port_s, cid.c_str());
-  String willTopic = String(mqtt_base) + "/" + device_id + "/status";
-  if (mqtt.connect(cid.c_str(), mqtt_user, mqtt_pass,
-                   willTopic.c_str(), 0, true, "offline")) {
+
+  char cid[48];
+  snprintf(cid, sizeof(cid), "esp-%s-%08x", device_id, ESP.getChipId());
+  char willTopic[80];
+  snprintf(willTopic, sizeof(willTopic), "%s/%s/status", mqtt_base, device_id);
+
+  Serial.printf("MQTT connect to %s:%s as %s ...\n", mqtt_server, mqtt_port_s, cid);
+  if (mqtt.connect(cid, mqtt_user, mqtt_pass, willTopic, 0, true, "offline")) {
     Serial.println("MQTT connected");
-    mqtt.publish(willTopic.c_str(), "online", true);
+    mqtt.publish(willTopic, "online", true);
+    char cmdTopic[80];
+    snprintf(cmdTopic, sizeof(cmdTopic), "%s/%s/cmd", mqtt_base, device_id);
+    mqtt.subscribe(cmdTopic);
+    stats.mqttReconnects++;
+    statsSave();
   } else {
     Serial.printf("MQTT failed rc=%d\n", mqtt.state());
   }
@@ -262,25 +419,31 @@ void mqttConnect() {
 
 void publishMQTT(float t, float h) {
   if (!mqtt.connected()) return;
-  StaticJsonDocument<192> doc;
-  doc["device"] = device_id;
-  doc["temp"]   = t;
-  doc["hum"]    = h;
-  doc["rssi"]   = WiFi.RSSI();
-  doc["ip"]     = WiFi.localIP().toString();
-  doc["uptime"] = (uint32_t)(millis() / 1000);
-  char buf[192];
-  size_t n = serializeJson(doc, buf);
-  String topic = String(mqtt_base) + "/" + device_id;
-  mqtt.publish(topic.c_str(), (const uint8_t*)buf, n, true);  // retained: latest reading per device
-  Serial.printf("MQTT pub %s: %s\n", topic.c_str(), buf);
+  IPAddress ip = WiFi.localIP();
+  char ipbuf[16];
+  snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
+  char buf[224];
+  int n = snprintf(buf, sizeof(buf),
+    "{\"device\":\"%s\",\"temp\":%.1f,\"hum\":%.0f,\"rssi\":%d,\"ip\":\"%s\",\"uptime\":%lu,\"fw\":\"%s\"}",
+    device_id, t, h, WiFi.RSSI(), ipbuf, (unsigned long)(millis() / 1000), FW_VERSION);
+  if (n < 0 || n >= (int)sizeof(buf)) return;
+  char topic[80];
+  snprintf(topic, sizeof(topic), "%s/%s", mqtt_base, device_id);
+  mqtt.publish(topic, (const uint8_t*)buf, n, true);   // retained: latest reading per device
+  Serial.printf("MQTT pub %s: %s\n", topic, buf);
 }
 
 // ---------------- Google Sheets ----------------
-// Apps Script /exec returns a 302 redirect to script.googleusercontent.com.
-// ESP8266HTTPClient won't re-POST across hosts (and HTTPC_FORCE_FOLLOW would
-// downgrade to GET, losing the body), so we follow redirects manually and
-// re-POST the same JSON to each hop.
+// Apps Script /exec returns a 302 to script.googleusercontent.com. The
+// ESP8266 HTTPClient won't re-POST across hosts, so we follow redirects
+// manually. Each hop is its own TLS handshake (~1–2 s); pumping the rest
+// of the loop between hops keeps MQTT/web/OTA alive.
+void pumpLoops() {
+  mqtt.loop();
+  server.handleClient();
+  ArduinoOTA.handle();
+}
+
 void postToSheet(float t, float h) {
   StaticJsonDocument<256> doc;
   doc["project"] = project_id;
@@ -290,15 +453,17 @@ void postToSheet(float t, float h) {
   doc["rssi"]    = WiFi.RSSI();
   doc["ip"]      = WiFi.localIP().toString();
   doc["uptime"]  = (uint32_t)(millis() / 1000);
+  doc["fw"]      = FW_VERSION;
   String body; serializeJson(doc, body);
 
   String host = gs_host;
   String path = gs_path;
 
   for (int hop = 0; hop < 4; hop++) {
+    pumpLoops();
     WiFiClientSecure client;
     client.setInsecure();
-    client.setBufferSizes(4096, 512);  // share TLS heap with the MQTT client
+    client.setBufferSizes(4096, 512);
 
     HTTPClient https;
     String url = String("https://") + host + path;
@@ -339,6 +504,23 @@ void postToSheet(float t, float h) {
 // ---------------- Web Server ----------------
 #include "index_html.h"
 
+const char* adminPassActive() {
+  if (admin_pass[0]) return admin_pass;
+#ifdef OTA_PASSWORD
+  return OTA_PASSWORD;
+#else
+  return "admin";
+#endif
+}
+
+bool requireAuth() {
+  if (!server.authenticate(ADMIN_USER, adminPassActive())) {
+    server.requestAuthentication();
+    return false;
+  }
+  return true;
+}
+
 String htmlEscape(const String& value) {
   String out;
   out.reserve(value.length() + 8);
@@ -360,8 +542,9 @@ void copyArg(char* target, size_t targetSize, const String& name) {
 }
 
 void handleRoot()  { server.send_P(200, "text/html", INDEX_HTML); }
+
 void handleApi() {
-  StaticJsonDocument<192> doc;
+  StaticJsonDocument<224> doc;
   doc["device"] = device_id;
   doc["temp"]   = isnan(lastTemp) ? 0 : lastTemp;
   doc["hum"]    = isnan(lastHum)  ? 0 : lastHum;
@@ -369,12 +552,31 @@ void handleApi() {
   doc["ip"]     = WiFi.localIP().toString();
   doc["uptime"] = (uint32_t)(millis() / 1000);
   doc["mqtt"]   = mqtt.connected();
+  doc["fw"]     = FW_VERSION;
   String s; serializeJson(doc, s);
   server.send(200, "application/json", s);
 }
+
+void handleMetrics() {
+  if (!requireAuth()) return;
+  StaticJsonDocument<256> doc;
+  doc["boots"]            = stats.boots;
+  doc["mqtt_reconnects"]  = stats.mqttReconnects;
+  doc["sensor_faults"]    = stats.sensorFaults;
+  doc["free_heap"]        = ESP.getFreeHeap();
+  doc["max_free_block"]   = ESP.getMaxFreeBlockSize();
+  doc["heap_frag"]        = ESP.getHeapFragmentation();
+  doc["uptime"]           = (uint32_t)(millis() / 1000);
+  doc["fw"]               = FW_VERSION;
+  doc["last_valid_age"]   = lastValidReadMs ? (uint32_t)((millis() - lastValidReadMs) / 1000) : 0;
+  String s; serializeJson(doc, s);
+  server.send(200, "application/json", s);
+}
+
 void handleConfigPage() {
+  if (!requireAuth()) return;
   String html;
-  html.reserve(5600);
+  html.reserve(6800);
   html += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>Room Temp Config</title><style>");
   html += F(":root{--bg:#0f1218;--panel:#171c25;--line:#2b3444;--text:#edf1f5;--mut:#9aa7b7;--acc:#9fb8ff}");
@@ -386,61 +588,105 @@ void handleConfigPage() {
   html += htmlEscape(device_id);
   html += F("</code> at <code>");
   html += WiFi.localIP().toString();
-  html += F("</code></p><form method='post' action='/config/save'><div class='grid'>");
+  html += F("</code> &middot; fw <code>" FW_VERSION "</code></p><form method='post' action='/config/save'><div class='grid'>");
   html += F("<label>Device name<input name='device_id' maxlength='23' value='"); html += htmlEscape(device_id); html += F("'></label>");
   html += F("<label>Project<input name='project_id' maxlength='23' value='"); html += htmlEscape(project_id); html += F("'></label>");
   html += F("<label>MQTT host<input name='mqtt_server' maxlength='63' value='"); html += htmlEscape(mqtt_server); html += F("'></label>");
   html += F("<label>MQTT port<input name='mqtt_port_s' maxlength='5' value='"); html += htmlEscape(mqtt_port_s); html += F("'></label>");
   html += F("<label>MQTT user<input name='mqtt_user' maxlength='39' value='"); html += htmlEscape(mqtt_user); html += F("'></label>");
-  html += F("<label>MQTT password<small>Leave blank to keep current password</small><input name='mqtt_pass' maxlength='39' type='password'></label>");
+  html += F("<label>MQTT password<small>Blank = keep current</small><input name='mqtt_pass' maxlength='39' type='password'></label>");
   html += F("<label>MQTT base topic<input name='mqtt_base' maxlength='39' value='"); html += htmlEscape(mqtt_base); html += F("'></label>");
   html += F("<label>Google Script host<input name='gs_host' maxlength='79' value='"); html += htmlEscape(gs_host); html += F("'></label>");
   html += F("</div><label>Google Script path<input name='gs_path' maxlength='139' value='"); html += htmlEscape(gs_path); html += F("'></label>");
-  html += F("<div class='actions'><button type='submit'>Save and restart</button><a class='btn' href='/'>Dashboard</a><a class='btn' href='/api'>API</a></div>");
+  char off[16];
+  html += F("<div class='grid'>");
+  snprintf(off, sizeof(off), "%.2f", temp_offset);
+  html += F("<label>Temp offset (°C)<small>Added to raw DHT reading</small><input name='temp_offset' value='"); html += off; html += F("'></label>");
+  snprintf(off, sizeof(off), "%.2f", hum_offset);
+  html += F("<label>Humidity offset (%)<input name='hum_offset' value='"); html += off; html += F("'></label>");
+  html += F("<label>Admin password<small>Blank = keep current (defaults to OTA password)</small><input name='admin_pass' maxlength='23' type='password'></label>");
+  html += F("</div><div class='actions'><button type='submit'>Save and restart</button><a class='btn' href='/'>Dashboard</a><a class='btn' href='/api'>API</a><a class='btn' href='/metrics'>Metrics</a></div>");
   html += F("</form></div></main></body></html>");
   server.send(200, "text/html", html);
 }
+
 void handleConfigSave() {
-  copyArg(device_id, sizeof(device_id), "device_id");
+  if (!requireAuth()) return;
+  copyArg(device_id,  sizeof(device_id),  "device_id");
   copyArg(project_id, sizeof(project_id), "project_id");
   copyArg(mqtt_server, sizeof(mqtt_server), "mqtt_server");
   copyArg(mqtt_port_s, sizeof(mqtt_port_s), "mqtt_port_s");
-  copyArg(mqtt_user, sizeof(mqtt_user), "mqtt_user");
+  copyArg(mqtt_user,   sizeof(mqtt_user),   "mqtt_user");
   if (server.hasArg("mqtt_pass") && server.arg("mqtt_pass").length() > 0) {
     server.arg("mqtt_pass").toCharArray(mqtt_pass, sizeof(mqtt_pass));
   }
   copyArg(mqtt_base, sizeof(mqtt_base), "mqtt_base");
-  copyArg(gs_host, sizeof(gs_host), "gs_host");
-  copyArg(gs_path, sizeof(gs_path), "gs_path");
+  copyArg(gs_host,   sizeof(gs_host),   "gs_host");
+  copyArg(gs_path,   sizeof(gs_path),   "gs_path");
+  if (server.hasArg("temp_offset")) temp_offset = server.arg("temp_offset").toFloat();
+  if (server.hasArg("hum_offset"))  hum_offset  = server.arg("hum_offset").toFloat();
+  if (server.hasArg("admin_pass") && server.arg("admin_pass").length() > 0) {
+    server.arg("admin_pass").toCharArray(admin_pass, sizeof(admin_pass));
+  }
   saveConfig();
   server.send(200, "text/html", "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body style='font-family:system-ui;background:#0f1218;color:#edf1f5;padding:2rem'><h1>Saved</h1><p>Restarting device...</p></body>");
   delay(600);
   ESP.restart();
 }
+
 void handleReset() {
+  if (!requireAuth()) return;
   server.send(200, "text/plain", "Erasing Wi-Fi & restarting...");
   delay(300);
   WiFi.disconnect(true);
   ESP.restart();
 }
 
+// ---------------- Button (runtime) ----------------
+// Short press (50ms..2s) -> trigger an immediate publish.
+// Long  press (>=5s)     -> wipe Wi-Fi credentials and reboot into portal.
+void serviceButton() {
+  static int prev = HIGH;
+  static unsigned long downAt = 0;
+  int v = digitalRead(BOOT_BTN);
+  unsigned long now = millis();
+  if (v == LOW && prev == HIGH) {
+    downAt = now;
+  } else if (v == LOW && prev == LOW) {
+    if (downAt && now - downAt >= 5000) {
+      needWifiWipe = true;
+      downAt = 0;                          // arm only once per press
+    }
+  } else if (v == HIGH && prev == LOW) {
+    if (downAt) {
+      unsigned long held = now - downAt;
+      if (held > 50 && held < 2000) needPublishNow = true;
+    }
+    downAt = 0;
+  }
+  prev = v;
+}
+
 // ---------------- Setup / Loop ----------------
 void setup() {
   Serial.begin(115200);
   delay(200);
-  Serial.println("\n=== Room Temp ESP8266 ===");
+  Serial.println("\n=== Room Temp ESP8266 fw " FW_VERSION " ===");
 
   Wire.begin(I2C_SDA, I2C_SCL);
   if (!display.begin(SSD1306_SWITCHCAPVCC, OLED_ADDR)) {
     Serial.println("OLED init failed");
   }
   display.clearDisplay(); display.display();
-  oledMsg("Booting...", "Room Temp", "ESP8266");
+  oledMsg("Booting...", "Room Temp", FW_VERSION);
 
   dht.begin();
   loadConfig();
 
-  // Hold FLASH (GPIO0) low at boot to force config portal
+  statsLoad();
+  stats.boots++;
+  statsSave();
+
   pinMode(BOOT_BTN, INPUT_PULLUP);
   bool force = (digitalRead(BOOT_BTN) == LOW);
   startPortal(force);
@@ -448,17 +694,16 @@ void setup() {
   oledMsg("WiFi OK", WiFi.SSID(), WiFi.localIP().toString());
   Serial.print("IP: "); Serial.println(WiFi.localIP());
 
-  // NTP for the daily reboot trigger. POSIX TZ string for Asia/Bangkok (UTC+7, no DST).
-  configTime("ICT-7", "pool.ntp.org", "time.google.com");
-
   secureClient.setInsecure();
   mqtt.setBufferSize(512);
+  mqtt.setCallback(mqttCallback);
 
-  server.on("/",      handleRoot);
-  server.on("/api",   handleApi);
-  server.on("/config", HTTP_GET, handleConfigPage);
+  server.on("/",            handleRoot);
+  server.on("/api",         handleApi);
+  server.on("/metrics",     handleMetrics);
+  server.on("/config",      HTTP_GET,  handleConfigPage);
   server.on("/config/save", HTTP_POST, handleConfigSave);
-  server.on("/reset", handleReset);
+  server.on("/reset",       HTTP_POST, handleReset);
   server.begin();
 
   // ---------------- OTA ----------------
@@ -476,7 +721,7 @@ void setup() {
     oledMsg("OTA Done", "Rebooting...");
   });
   ArduinoOTA.onProgress([](unsigned int progress, unsigned int total) {
-    unsigned int pct = (progress / (total / 100));
+    unsigned int pct = total ? (unsigned int)((uint64_t)progress * 100 / total) : 0;
     Serial.printf("OTA: %u%%\r", pct);
     char line[24]; snprintf(line, sizeof(line), "%u%%", pct);
     oledMsg("OTA Update", line, WiFi.localIP().toString());
@@ -492,21 +737,28 @@ void setup() {
 void loop() {
   ArduinoOTA.handle();
   server.handleClient();
+  serviceButton();
   if (!mqtt.connected()) mqttConnect();
   mqtt.loop();
 
   unsigned long now = millis();
 
+  if (now - lastShiftMs > SHIFT_INTERVAL) {
+    lastShiftMs = now;
+    yShift = (yShift == 0) ? 1 : 0;
+  }
+
   if (now - lastReadMs > READ_INTERVAL) {
     lastReadMs = now;
-    float t = dht.readTemperature();
-    float h = dht.readHumidity();
-    if (!isnan(t) && !isnan(h)) { lastTemp = t; lastHum = h; }
+    readSensorSample();
     oledData();
   }
 
-  if (!isnan(lastTemp) && now - lastPubMs > PUB_INTERVAL) {
+  sensorWatchdog();
+
+  if (!isnan(lastTemp) && (needPublishNow || now - lastPubMs > PUB_INTERVAL)) {
     lastPubMs = now;
+    needPublishNow = false;
     publishMQTT(lastTemp, lastHum);
   }
 
@@ -516,17 +768,18 @@ void loop() {
     postToSheet(lastTemp, lastHum);
   }
 
-  if (now > REBOOT_MIN_UPTIME && now - lastRebootCheckMs > REBOOT_CHECK_INTERVAL) {
-    lastRebootCheckMs = now;
-    time_t ts = time(nullptr);
-    struct tm lt;
-    localtime_r(&ts, &lt);
-    if (lt.tm_year + 1900 >= 2024 &&
-        lt.tm_hour == REBOOT_HOUR && lt.tm_min == REBOOT_MINUTE) {
-      Serial.println("Daily reboot at 08:00 Asia/Bangkok");
-      oledMsg("Daily reboot", "08:00 ICT", "Restarting...");
-      delay(500);
-      ESP.restart();
-    }
+  // Deferred actions — handled here so we never reboot mid-publish.
+  if (needWifiWipe) {
+    Serial.println("Long-press: wiping Wi-Fi credentials");
+    oledMsg("WiFi reset", "Long press", "Rebooting...");
+    WiFi.disconnect(true);
+    delay(400);
+    ESP.restart();
+  }
+  if (needReboot) {
+    Serial.println("MQTT cmd: reboot");
+    oledMsg("Reboot", "MQTT cmd");
+    delay(400);
+    ESP.restart();
   }
 }
