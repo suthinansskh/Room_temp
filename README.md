@@ -154,6 +154,8 @@ The script appends `[timestamp, device, temp, hum, rssi]` per POST and exposes:
 - `GET …/exec?action=latest&device=room1`
 - `GET …/exec?action=history&device=room1&n=200`
 - `GET …/exec?action=summary` — latest reading per device (handy for a dashboard refresh)
+- `GET …/exec?action=daily_history&device=room1&n=60` — daily avg/min/max temp & humidity per device (feeds the dashboard's **Daily** chart)
+- `GET …/exec?action=monthly_history&device=room1&n=24` — monthly aggregates (feeds the dashboard's **Monthly** chart)
 
 ### Deploy with `clasp` (CLI, recommended)
 
@@ -209,7 +211,7 @@ The dashboard:
 - Subscribes to `room/+` (data) and `room/+/status` (LWT online/offline).
 - Renders one card per device in a responsive grid showing **temperature + humidity**.
 - Marks a device **stale** (dimmed) after the configured timeout, **offline** when its LWT fires.
-- Click a card to open a temp/humidity chart for that device (live, plus optional history from Sheets).
+- Click a card to open a temp/humidity chart for that device with a **Live / Daily / Monthly** toggle — Live streams MQTT (backfilled from Sheets), Daily and Monthly chart the avg temp/humidity aggregates straight from Google Sheets.
 - Shows a fleet summary: online count, average temp, average humidity, min/max temp.
 
 Credentials live only in the visitor's `localStorage`. For a public dashboard, always use the **subscribe-only** HiveMQ user.
