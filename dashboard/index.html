@@ -431,6 +431,11 @@
   .detail-body { padding: 16px 18px 18px; display: grid; gap: 16px; }
   .selected-readings { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
   .selected-readings .metric { box-shadow: none; background: var(--panel-2); }
+  .chart-tools {
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 10px; flex-wrap: wrap;
+  }
+  .chart-tools .muted { font-size: .74rem; text-align: right; }
   .chart { height: 320px; min-height: 320px; }
   .detail-grid {
     display: grid; gap: 0;
@@ -551,7 +556,7 @@
         <label>Base topic<input id="cfgBase" value="room" /></label>
         <label>Stale after (seconds)<input id="cfgStale" value="45" /></label>
         <label>Google Sheets /exec URL<input id="cfgGs" placeholder="https://script.google.com/macros/s/.../exec" /></label>
-        <label>Visible device IDs<input id="cfgDevs" placeholder="Drug_OPD1" /></label>
+        <label>Visible device IDs<input id="cfgDevs" placeholder="room1,room2,room3" /></label>
         <button id="save" class="primary-btn">Save and reconnect</button>
       </div>
     </details>
@@ -609,6 +614,14 @@
           <div class="selected-readings">
             <div class="metric"><span>Temperature</span><b><span id="dTemp">--</span> °C</b></div>
             <div class="metric"><span>Humidity</span><b><span id="dHum">--</span> %</b></div>
+          </div>
+          <div class="chart-tools">
+            <div class="chips" role="tablist" aria-label="Chart range">
+              <button type="button" class="chip on" data-range="live">Live</button>
+              <button type="button" class="chip" data-range="daily">Daily</button>
+              <button type="button" class="chip" data-range="monthly">Monthly</button>
+            </div>
+            <span id="chartHint" class="muted"></span>
           </div>
           <div class="chart"><canvas id="chart"></canvas></div>
           <div class="detail-grid">
@@ -740,13 +753,35 @@ function findCard(id) {
   return Array.from(nodes).find(el => el.dataset.id === id);
 }
 
+let chartRange = 'live'; // 'live' | 'daily' | 'monthly'
+
+function syncRangeChips() {
+  document.querySelectorAll('.chip[data-range]').forEach(b =>
+    b.classList.toggle('on', b.dataset.range === chartRange));
+}
+
+function setChartHint(text) {
+  $('chartHint').textContent = text || '';
+}
+
 function setActive(id) {
   activeId = id;
   document.querySelectorAll('.dev').forEach(el => el.classList.toggle('active', el.dataset.id === id));
   $('detail').hidden = false;
+  chartRange = 'live';
+  syncRangeChips();
   updateDetail();
-  redrawChart();
-  loadHistory(id);
+  loadChartData(id);
+}
+
+function loadChartData(id) {
+  if (chartRange === 'live') {
+    setChartHint('');
+    redrawChart();       // show buffered live points immediately
+    loadRawHistory(id);  // then backfill from Google Sheets
+  } else {
+    loadAggregateHistory(id, chartRange);
+  }
 }
 
 function renderCard(id) {
@@ -942,19 +977,30 @@ const chart = new Chart($('chart').getContext('2d'), {
   }
 });
 
+function setChartSeries(labels, temps, hums, aggregated) {
+  chart.data.labels = labels;
+  chart.data.datasets[0].data = temps;
+  chart.data.datasets[1].data = hums;
+  chart.data.datasets[0].label = aggregated ? 'Avg temp (°C)' : 'Temp (°C)';
+  chart.data.datasets[1].label = aggregated ? 'Avg humidity (%)' : 'Humidity (%)';
+  chart.update();
+}
+
 function redrawChart() {
   const d = devices[activeId];
   if (!d) return;
-  chart.data.labels = d.history.map(p => new Date(p.t).toLocaleTimeString());
-  chart.data.datasets[0].data = d.history.map(p => p.T);
-  chart.data.datasets[1].data = d.history.map(p => p.H);
-  chart.update();
+  setChartSeries(
+    d.history.map(p => new Date(p.t).toLocaleTimeString()),
+    d.history.map(p => p.T),
+    d.history.map(p => p.H),
+    false
+  );
 }
 
 function pushHistory(d, t, T, H) {
   d.history.push({ t, T, H });
   if (d.history.length > 300) d.history.shift();
-  if (activeId === d.id) {
+  if (activeId === d.id && chartRange === 'live') {
     chart.data.labels.push(new Date(t).toLocaleTimeString());
     chart.data.datasets[0].data.push(T);
     chart.data.datasets[1].data.push(H);
@@ -1032,7 +1078,7 @@ function connect() {
   });
 }
 
-async function loadHistory(id) {
+async function loadRawHistory(id) {
   if (!cfg.cfgGs) return;
   try {
     const r = await fetch(`${cfg.cfgGs}?action=history&device=${encodeURIComponent(id)}&n=200`);
@@ -1040,11 +1086,62 @@ async function loadHistory(id) {
     if (!Array.isArray(arr)) return;
     const d = devices[id] || (devices[id] = blankDevice(id));
     d.history = arr.map(row => ({ t: new Date(row.ts).getTime(), T: +row.temp, H: +row.hum }));
-    if (activeId === id) redrawChart();
+    if (activeId === id && chartRange === 'live') redrawChart();
   } catch (e) {
     console.warn('history fetch failed', e);
   }
 }
+
+// The report sheets store periods as 'yyyy-MM-dd' / 'yyyy-MM' strings, but
+// Google Sheets may coerce them into dates, which serialize as ISO strings.
+function fmtPeriod(value, range) {
+  const s = String(value);
+  if (/^\d{4}-\d{2}(-\d{2})?$/.test(s)) return s;
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return s;
+  return range === 'monthly'
+    ? d.toLocaleDateString([], { year: 'numeric', month: 'short' })
+    : d.toLocaleDateString([], { month: 'short', day: 'numeric' });
+}
+
+async function loadAggregateHistory(id, range) {
+  if (!cfg.cfgGs) {
+    setChartSeries([], [], [], true);
+    setChartHint('Set the Google Sheets /exec URL in Settings to load history');
+    return;
+  }
+  const action = range === 'monthly' ? 'monthly_history' : 'daily_history';
+  const n = range === 'monthly' ? 24 : 60;
+  setChartHint(`Loading ${range} history from Google Sheets...`);
+  try {
+    const r = await fetch(`${cfg.cfgGs}?action=${action}&device=${encodeURIComponent(id)}&n=${n}`);
+    const arr = await r.json();
+    if (activeId !== id || chartRange !== range) return; // user moved on
+    if (!Array.isArray(arr)) {
+      setChartHint('Unexpected response from Google Sheets endpoint');
+      return;
+    }
+    setChartSeries(
+      arr.map(row => fmtPeriod(row.period, range)),
+      arr.map(row => +row.avg_temp),
+      arr.map(row => +row.avg_hum),
+      true
+    );
+    setChartHint(arr.length ? `${arr.length} ${range} averages from Google Sheets` : 'No history in Google Sheets yet');
+  } catch (e) {
+    console.warn('aggregate history fetch failed', e);
+    if (activeId === id && chartRange === range) setChartHint('Failed to load history from Google Sheets');
+  }
+}
+
+document.querySelectorAll('.chip[data-range]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    if (chartRange === btn.dataset.range) return;
+    chartRange = btn.dataset.range;
+    syncRangeChips();
+    if (activeId) loadChartData(activeId);
+  });
+});
 
 seedExpected();
 refreshStaleness();

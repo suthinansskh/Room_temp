@@ -21,6 +21,8 @@
  *   GET /exec?project=room_temp&action=latest  [&device=room1]
  *   GET /exec?project=room_temp&action=history [&device=room1&n=100]
  *   GET /exec?project=room_temp&action=summary           (latest per device)
+ *   GET /exec?project=room_temp&action=daily_history   [&device=room1&n=60]   (daily aggregates as JSON)
+ *   GET /exec?project=room_temp&action=monthly_history [&device=room1&n=24]   (monthly aggregates as JSON)
  *   GET /exec?project=room_temp&action=report_daily      (refresh daily report)
  *   GET /exec?project=room_temp&action=report_monthly    (refresh monthly report)
  *   GET /exec?project=room_temp&action=refresh_reports   (refresh both reports)
@@ -114,6 +116,16 @@ function doGet(e) {
   }
   if (action === 'refresh_reports') {
     return _json(refreshReports(project));
+  }
+  if (action === 'daily_history' || action === 'monthly_history') {
+    const isMonthly = action === 'monthly_history';
+    if (isMonthly) refreshMonthlyReport(project);
+    else refreshDailyReport(project);
+    const suffix = isMonthly ? MONTHLY_REPORT_SUFFIX : DAILY_REPORT_SUFFIX;
+    const reportRows = _readSheetRecords(_sanitize(project + suffix))
+      .filter(r => !device || String(r.device) === device);
+    const n = Math.max(1, Math.min(500, parseInt(e.parameter.n || (isMonthly ? '24' : '60'), 10)));
+    return _json(reportRows.slice(-n));
   }
 
   const sh = _getOrCreateSheet(project);
@@ -271,8 +283,16 @@ function _buildReportRows(project, periodType) {
 }
 
 function _readProjectRecords(project) {
-  const sh = _getOrCreateSheet(project);
-  const values = sh.getDataRange().getValues();
+  return _recordsFromValues(_getOrCreateSheet(project).getDataRange().getValues());
+}
+
+function _readSheetRecords(sheetName) {
+  const sh = _ss().getSheetByName(sheetName);
+  if (!sh) return [];
+  return _recordsFromValues(sh.getDataRange().getValues());
+}
+
+function _recordsFromValues(values) {
   if (values.length < 2) return [];
   const header = values[0].map(String);
   return values.slice(1).map(row => {
