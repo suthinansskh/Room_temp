@@ -1,0 +1,906 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Room Climate Dashboard</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%23111627'/%3E%3Cpath d='M24 12a8 8 0 0 1 16 0v23.2a14 14 0 1 1-16 0V12Z' fill='%2388d1c9'/%3E%3Ccircle cx='32' cy='46' r='8' fill='%23f28c6b'/%3E%3C/svg%3E" />
+<style>
+  :root {
+    --bg: #0a0d13;
+    --bg-elev: #0f131b;
+    --panel: #12171f;
+    --panel-2: #161c26;
+    --panel-3: #1b222d;
+    --line: #232b38;
+    --line-soft: rgba(255,255,255,.05);
+    --text: #f4f6f8;
+    --soft: #c4cbd5;
+    --muted: #7e8a99;
+    --temp: #ff9572;
+    --temp-soft: rgba(255,149,114,.14);
+    --hum: #7fd6cf;
+    --hum-soft: rgba(127,214,207,.14);
+    --ok: #7ed094;
+    --warn: #f4cf6f;
+    --bad: #f47c7c;
+    --accent: #a8baff;
+    --accent-soft: rgba(168,186,255,.14);
+    --shadow-sm: 0 1px 2px rgba(0,0,0,.32);
+    --shadow-md: 0 10px 30px rgba(0,0,0,.38);
+    --radius: 12px;
+    --radius-sm: 10px;
+  }
+
+  * { box-sizing: border-box; }
+  html { min-height: 100%; background: var(--bg); }
+  body {
+    min-height: 100%;
+    margin: 0;
+    color: var(--text);
+    background:
+      radial-gradient(1100px 540px at 82% -10%, rgba(168,186,255,.07), transparent 70%),
+      radial-gradient(820px 460px at -8% 8%, rgba(127,214,207,.05), transparent 65%),
+      var(--bg);
+    font-family: 'Inter', ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    font-feature-settings: 'cv11','ss01';
+    -webkit-font-smoothing: antialiased;
+    letter-spacing: -.005em;
+  }
+
+  button, input, select { font: inherit; color: inherit; }
+  button { border: 0; cursor: pointer; background: transparent; }
+  a { color: inherit; }
+
+  .shell {
+    min-height: 100vh;
+    display: grid;
+    grid-template-columns: 264px minmax(0, 1fr);
+  }
+
+  /* Sidebar */
+  .sidebar {
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    padding: 22px 18px;
+    border-right: 1px solid var(--line);
+    background:
+      linear-gradient(180deg, rgba(255,255,255,.015), transparent 240px),
+      rgba(10,13,19,.92);
+    backdrop-filter: blur(16px);
+    display: flex;
+    flex-direction: column;
+    gap: 22px;
+    overflow-y: auto;
+  }
+
+  .brand { display: flex; align-items: center; gap: 12px; }
+  .brand-mark {
+    width: 40px; height: 40px;
+    display: grid; place-items: center;
+    border-radius: 10px;
+    background: linear-gradient(135deg, var(--hum), var(--temp));
+    color: #0a0d13;
+    font-weight: 800;
+    letter-spacing: -.02em;
+    box-shadow: 0 0 0 1px rgba(255,255,255,.06), inset 0 1px 0 rgba(255,255,255,.22);
+  }
+  .brand-text { display: grid; gap: 2px; min-width: 0; }
+  .brand-text p { margin: 0; }
+  h1 { margin: 0; font-size: 1rem; font-weight: 700; line-height: 1.15; letter-spacing: -.01em; }
+  .muted { color: var(--muted); }
+  .brand-text .muted { font-size: .74rem; line-height: 1.35; }
+
+  .status-stack { display: grid; gap: 8px; }
+  .pill {
+    min-height: 40px;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 10px;
+    padding: 0 12px;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    background: var(--panel);
+    color: var(--soft);
+    font-size: .82rem;
+  }
+  .pill > span:first-child {
+    color: var(--muted); font-size: .68rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .12em;
+  }
+  .pill strong {
+    color: var(--text); font-weight: 600;
+    display: inline-flex; align-items: center; gap: 8px;
+  }
+  .pill strong::before {
+    content: ""; width: 7px; height: 7px; border-radius: 999px;
+    background: var(--muted);
+    box-shadow: 0 0 0 3px rgba(126,138,153,.18);
+  }
+  .pill.ok strong { color: var(--ok); }
+  .pill.ok strong::before { background: var(--ok); box-shadow: 0 0 0 3px rgba(126,208,148,.2); }
+  .pill.bad strong { color: var(--bad); }
+  .pill.bad strong::before { background: var(--bad); box-shadow: 0 0 0 3px rgba(244,124,124,.2); }
+
+  .side-info {
+    margin-top: auto;
+    border-top: 1px solid var(--line-soft);
+    padding-top: 16px;
+    color: var(--muted);
+    font-size: .74rem;
+    line-height: 1.5;
+  }
+  .side-info code {
+    background: var(--bg-elev); border: 1px solid var(--line);
+    border-radius: 6px; padding: 1px 6px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: .92em; color: var(--soft);
+  }
+
+  /* Content */
+  .content { min-width: 0; padding: 28px 32px 32px; }
+  .topbar {
+    display: flex;
+    align-items: flex-end;
+    justify-content: space-between;
+    gap: 18px;
+    margin-bottom: 24px;
+    padding-bottom: 18px;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .eyebrow {
+    margin: 0 0 6px;
+    color: var(--muted);
+    font-size: .68rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .14em;
+  }
+  .topbar h2 {
+    margin: 0;
+    font-size: 1.6rem; line-height: 1.1;
+    font-weight: 700; letter-spacing: -.02em;
+  }
+  .clock {
+    color: var(--muted); font-size: .82rem;
+    white-space: nowrap;
+    font-variant-numeric: tabular-nums;
+  }
+
+  /* Metric tiles */
+  .metrics {
+    display: grid;
+    grid-template-columns: repeat(4, minmax(160px, 1fr));
+    gap: 14px;
+    margin-bottom: 22px;
+  }
+  .metric {
+    position: relative;
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background:
+      linear-gradient(180deg, rgba(255,255,255,.015), transparent 80px),
+      var(--panel);
+    padding: 16px 18px;
+    box-shadow: var(--shadow-sm);
+    overflow: hidden;
+  }
+  .metric::before {
+    content: ""; position: absolute;
+    top: 0; left: 0; right: 0; height: 2px;
+    background: var(--accent); opacity: .85;
+  }
+  .metric.t-online::before { background: var(--ok); }
+  .metric.t-temp::before { background: var(--temp); }
+  .metric.t-hum::before { background: var(--hum); }
+  .metric.t-range::before { background: var(--warn); }
+  .metric > span {
+    display: block; color: var(--muted);
+    font-size: .68rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .12em;
+  }
+  .metric b span { display: inline; color: inherit; font-size: inherit; }
+  .metric b {
+    display: block; margin-top: 10px;
+    font-size: 1.55rem; line-height: 1.05;
+    font-weight: 700; letter-spacing: -.02em;
+    font-variant-numeric: tabular-nums;
+  }
+  .metric small {
+    display: block; margin-top: 6px;
+    color: var(--muted); font-size: .72rem; font-weight: 500;
+  }
+
+  /* Workspace */
+  .workspace {
+    display: grid;
+    grid-template-columns: minmax(0, 1fr) 420px;
+    gap: 16px;
+    align-items: start;
+  }
+  .panel {
+    border: 1px solid var(--line);
+    border-radius: var(--radius);
+    background: var(--panel);
+    box-shadow: var(--shadow-sm);
+    overflow: hidden;
+  }
+  .panel-head {
+    min-height: 56px;
+    padding: 14px 18px;
+    border-bottom: 1px solid var(--line-soft);
+    display: flex; align-items: center; justify-content: space-between;
+    gap: 12px;
+  }
+  .panel-head h3 {
+    margin: 0; font-size: .95rem; font-weight: 700;
+    letter-spacing: -.005em;
+  }
+  .panel-head span { color: var(--muted); font-size: .78rem; }
+
+  /* Toolbar (search/sort/filter) */
+  .toolbar {
+    display: flex; flex-wrap: wrap; gap: 10px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--line-soft);
+    background: rgba(255,255,255,.012);
+  }
+  .search { position: relative; flex: 1 1 200px; min-width: 0; }
+  .search input { padding-left: 32px; background: var(--bg-elev); }
+  .search::before {
+    content: ""; position: absolute;
+    left: 11px; top: 50%;
+    width: 11px; height: 11px;
+    border: 1.5px solid var(--muted); border-radius: 999px;
+    transform: translateY(-55%);
+    pointer-events: none;
+  }
+  .search::after {
+    content: ""; position: absolute;
+    left: 21px; top: calc(50% + 4px);
+    width: 5px; height: 1.5px; background: var(--muted);
+    transform: rotate(45deg); transform-origin: left;
+    pointer-events: none;
+  }
+  input, select {
+    width: 100%; min-width: 0;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    background: var(--bg-elev);
+    color: var(--text);
+    padding: 9px 11px;
+    font-size: .84rem;
+    outline: none;
+    transition: border-color .15s, box-shadow .15s;
+  }
+  input::placeholder { color: #5a6573; }
+  input:focus, select:focus {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+  }
+  .toolbar select {
+    flex: 0 0 auto; min-width: 150px;
+    padding-right: 30px;
+    background: var(--bg-elev);
+    -webkit-appearance: none; appearance: none;
+    background-image:
+      linear-gradient(45deg, transparent 50%, var(--muted) 50%),
+      linear-gradient(135deg, var(--muted) 50%, transparent 50%);
+    background-position: calc(100% - 14px) calc(50% - 1px), calc(100% - 10px) calc(50% - 1px);
+    background-size: 4px 4px, 4px 4px;
+    background-repeat: no-repeat;
+  }
+  .chips {
+    display: inline-flex; gap: 4px; flex-wrap: nowrap;
+    border: 1px solid var(--line); border-radius: 10px;
+    padding: 3px; background: var(--bg-elev);
+  }
+  .chip {
+    padding: 6px 12px;
+    border-radius: 7px;
+    color: var(--soft);
+    font-size: .76rem; font-weight: 600;
+    background: transparent;
+    transition: background .15s, color .15s;
+    white-space: nowrap;
+  }
+  .chip:hover { color: var(--text); }
+  .chip.on {
+    background: var(--panel-3);
+    color: var(--text);
+    box-shadow: inset 0 0 0 1px var(--line);
+  }
+
+  /* Device grid */
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+    gap: 12px;
+    padding: 14px;
+  }
+  .grid:empty::after,
+  .grid.no-matches::after {
+    content: "No devices match the current filters.";
+    color: var(--muted); font-size: .85rem;
+    padding: 20px; text-align: center;
+    grid-column: 1 / -1;
+  }
+  .dev {
+    position: relative;
+    min-height: 168px;
+    border: 1px solid var(--line);
+    border-radius: var(--radius-sm);
+    background: var(--panel-2);
+    color: var(--text);
+    padding: 14px 16px;
+    text-align: left;
+    transition: border-color .15s, transform .15s, background .15s, box-shadow .15s;
+  }
+  .dev::before {
+    content: ""; position: absolute;
+    left: -1px; top: 16px; bottom: 16px;
+    width: 3px; border-radius: 3px;
+    background: transparent;
+    transition: background .15s;
+  }
+  .dev:hover { transform: translateY(-1px); border-color: #3a4558; box-shadow: var(--shadow-sm); }
+  .dev.active { border-color: var(--accent); background: var(--panel-3); }
+  .dev.active::before { background: var(--accent); }
+  .dev.stale { opacity: .82; }
+  .dev.off { opacity: .58; }
+  .dev.hidden { display: none !important; }
+
+  .dev-top { display: flex; align-items: center; justify-content: space-between; gap: 10px; }
+  .dev-name {
+    min-width: 0; font-size: .92rem; font-weight: 700;
+    letter-spacing: -.005em;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .dot {
+    width: 8px; height: 8px; border-radius: 999px;
+    background: var(--ok); flex: 0 0 auto;
+    box-shadow: 0 0 0 3px rgba(126,208,148,.2);
+  }
+  .dev.stale .dot { background: var(--warn); box-shadow: 0 0 0 3px rgba(244,207,111,.2); }
+  .dev.off .dot { background: var(--bad); box-shadow: 0 0 0 3px rgba(244,124,124,.2); }
+
+  .values { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin: 16px 0 14px; }
+  .reading span {
+    display: block; color: var(--muted);
+    font-size: .66rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .12em;
+  }
+  .reading b {
+    display: block; margin-top: 4px;
+    font-size: 1.7rem; line-height: 1;
+    font-weight: 700; letter-spacing: -.02em;
+    font-variant-numeric: tabular-nums;
+  }
+  .reading b small {
+    font-size: .55em; font-weight: 600;
+    margin-left: 3px; opacity: .7;
+  }
+  .reading.temp b { color: var(--temp); }
+  .reading.hum b { color: var(--hum); }
+
+  .dev-meta { display: flex; flex-wrap: wrap; gap: 6px; color: var(--muted); font-size: .72rem; }
+  .tag {
+    max-width: 100%;
+    padding: 3px 9px;
+    border: 1px solid var(--line);
+    border-radius: 999px;
+    background: var(--bg-elev);
+    font-weight: 500;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  }
+  .tag.link { color: var(--accent); text-decoration: none; }
+  .tag.link:hover { background: var(--accent-soft); border-color: var(--accent); }
+
+  /* Detail */
+  .detail { overflow: hidden; }
+  .detail[hidden] { display: none; }
+  .detail-body { padding: 16px 18px 18px; display: grid; gap: 16px; }
+  .selected-readings { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .selected-readings .metric { box-shadow: none; background: var(--panel-2); }
+  .chart { height: 320px; min-height: 320px; }
+  .detail-grid {
+    display: grid; gap: 0;
+    border-top: 1px solid var(--line-soft);
+    padding-top: 4px;
+  }
+  .detail-row {
+    display: flex; justify-content: space-between; align-items: center;
+    gap: 12px;
+    padding: 9px 0;
+    color: var(--muted); font-size: .82rem;
+    border-bottom: 1px solid var(--line-soft);
+  }
+  .detail-row:last-child { border-bottom: 0; }
+  .detail-row b {
+    color: var(--text); font-weight: 600;
+    text-align: right;
+    font-variant-numeric: tabular-nums;
+  }
+  .ip-link { color: var(--accent); text-decoration: none; }
+  .ip-link:hover { text-decoration: underline; }
+
+  #detailStatus {
+    font-size: .68rem; font-weight: 700;
+    text-transform: uppercase; letter-spacing: .1em;
+    padding: 4px 10px; border-radius: 999px;
+    background: var(--bg-elev); border: 1px solid var(--line);
+    color: var(--soft);
+  }
+
+  footer {
+    padding: 20px 32px 28px;
+    color: var(--muted); font-size: .78rem;
+  }
+  code {
+    background: var(--bg-elev); border: 1px solid var(--line);
+    border-radius: 6px; padding: 1px 6px;
+    font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
+    font-size: .85em;
+  }
+
+  /* Tablet */
+  @media (max-width: 1180px) {
+    .workspace { grid-template-columns: minmax(0, 1fr) 380px; }
+  }
+  @media (max-width: 1024px) {
+    .shell { grid-template-columns: 1fr; }
+    .sidebar {
+      position: static; height: auto;
+      flex-direction: row; flex-wrap: wrap;
+      align-items: center;
+      gap: 14px; padding: 16px 24px;
+    }
+    .brand { flex: 1 1 220px; min-width: 0; }
+    .status-stack { flex: 0 0 auto; display: flex; gap: 8px; }
+    .side-info { width: 100%; margin-top: 4px; padding-top: 14px; }
+    .workspace { grid-template-columns: 1fr; }
+    .content { padding: 24px; }
+    .chart { height: 280px; min-height: 280px; }
+  }
+
+  /* Mobile */
+  @media (max-width: 760px) {
+    .content { padding: 20px 16px 28px; }
+    .sidebar { padding: 14px 16px; gap: 12px; }
+    .brand { width: 100%; }
+    .status-stack { width: 100%; display: grid; grid-template-columns: 1fr 1fr; }
+    .topbar {
+      align-items: flex-start; flex-direction: column;
+      padding-bottom: 14px; margin-bottom: 18px;
+    }
+    .topbar h2 { font-size: 1.35rem; }
+    .metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }
+    .metric { padding: 14px; }
+    .metric b { font-size: 1.35rem; }
+    .toolbar { padding: 10px; }
+    .search { flex: 1 1 100%; }
+    .chips { width: 100%; }
+    .chip { flex: 1; text-align: center; }
+    .toolbar select { width: 100%; }
+    .grid { grid-template-columns: 1fr; padding: 12px; }
+    .selected-readings { grid-template-columns: 1fr 1fr; }
+    .chart { height: 240px; min-height: 240px; }
+    footer { padding: 14px 16px 22px; }
+  }
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="brand-mark">RT</div>
+      <div class="brand-text">
+        <h1>Room Climate</h1>
+        <p class="muted">Live temperature and humidity telemetry</p>
+      </div>
+    </div>
+
+    <div class="status-stack">
+      <div id="mqttPill" class="pill"><span>MQTT</span><strong>connecting...</strong></div>
+      <div id="countPill" class="pill"><span>Devices</span><strong>0</strong></div>
+    </div>
+
+    <div class="side-info">
+      Streaming live from the server over <code>/events</code> (SSE).
+      The server bridges MQTT on base topic <code id="baseTopic">room</code>;
+      broker credentials are configured server-side, not in the browser.
+    </div>
+  </aside>
+
+  <main class="content">
+    <div class="topbar">
+      <div>
+        <p class="eyebrow">Dashboard</p>
+        <h2>Rooms overview</h2>
+      </div>
+      <div id="clock" class="clock">--</div>
+    </div>
+
+    <section class="metrics" aria-label="Summary">
+      <div class="metric t-online"><span>Online</span><b id="sOnline">0</b><small>active sensors</small></div>
+      <div class="metric t-temp"><span>Average temperature</span><b><span id="sTemp">--</span> °C</b><small>online rooms</small></div>
+      <div class="metric t-hum"><span>Average humidity</span><b><span id="sHum">--</span> %</b><small>online rooms</small></div>
+      <div class="metric t-range"><span>Temperature range</span><b id="sMinMax">--</b><small>min / max</small></div>
+    </section>
+
+    <div class="workspace">
+      <section class="panel">
+        <div class="panel-head">
+          <h3>Devices</h3>
+          <span id="deviceHint">Waiting for data</span>
+        </div>
+        <div class="toolbar">
+          <div class="search">
+            <input id="qSearch" type="search" autocomplete="off" placeholder="Search devices..." aria-label="Search devices" />
+          </div>
+          <div class="chips" role="tablist" aria-label="Filter by status">
+            <button type="button" class="chip on" data-filter="all">All</button>
+            <button type="button" class="chip" data-filter="online">Online</button>
+            <button type="button" class="chip" data-filter="stale">Stale</button>
+            <button type="button" class="chip" data-filter="off">Offline</button>
+          </div>
+          <select id="qSort" aria-label="Sort devices">
+            <option value="name">Name (A–Z)</option>
+            <option value="temp-desc">Temp (high → low)</option>
+            <option value="temp-asc">Temp (low → high)</option>
+            <option value="status">Status (online first)</option>
+            <option value="recent">Last update</option>
+          </select>
+        </div>
+        <div id="grid" class="grid"></div>
+      </section>
+
+      <section class="panel detail" id="detail" hidden>
+        <div class="panel-head">
+          <h3 id="detailTitle">Device</h3>
+          <span id="detailStatus">--</span>
+        </div>
+        <div class="detail-body">
+          <div class="selected-readings">
+            <div class="metric"><span>Temperature</span><b><span id="dTemp">--</span> °C</b></div>
+            <div class="metric"><span>Humidity</span><b><span id="dHum">--</span> %</b></div>
+          </div>
+          <div class="chart"><canvas id="chart"></canvas></div>
+          <div class="detail-grid">
+            <div class="detail-row"><span>IP address</span><b id="dIp">--</b></div>
+            <div class="detail-row"><span>RSSI</span><b id="dRssi">--</b></div>
+            <div class="detail-row"><span>Uptime</span><b id="dUptime">--</b></div>
+            <div class="detail-row"><span>Firmware</span><b id="dFw">--</b></div>
+            <div class="detail-row"><span>Last update</span><b id="dLast">--</b></div>
+          </div>
+        </div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<footer>
+  Live data via a server-side MQTT&rarr;SSE bridge. Subscribes to <code>&lt;base&gt;/+</code> and <code>&lt;base&gt;/+/status</code> on HiveMQ Cloud.
+</footer>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<script>
+const $ = id => document.getElementById(id);
+
+let devices = {};      // id -> { id, temp, hum, rssi, uptime, ip, fw, lastTs, status, history }
+let activeId = null;
+let serverNow = Date.now();        // server clock from the latest snapshot
+let serverNowAtClient = Date.now(); // client clock when that snapshot arrived
+
+// Approximate the server's "now" using the offset from the last snapshot, so
+// "Xs ago" labels stay accurate even if the client clock is skewed.
+function approxServerNow() { return serverNow + (Date.now() - serverNowAtClient); }
+
+function escapeHtml(value) {
+  return String(value).replace(/[&<>'"]/g, char => ({ '&':'&amp;', '<':'&lt;', '>':'&gt;', "'":'&#39;', '"':'&quot;' }[char]));
+}
+
+function fmtAge(ts) {
+  if (!ts) return 'no data';
+  const seconds = Math.max(0, Math.round((approxServerNow() - ts) / 1000));
+  if (seconds < 60) return seconds + 's ago';
+  const minutes = Math.round(seconds / 60);
+  if (minutes < 60) return minutes + 'm ago';
+  return Math.round(minutes / 60) + 'h ago';
+}
+
+function fmtUptime(seconds) {
+  if (seconds == null || isNaN(seconds)) return '--';
+  const mins = Math.floor(seconds / 60);
+  const hrs = Math.floor(mins / 60);
+  const days = Math.floor(hrs / 24);
+  if (days > 0) return `${days}d ${hrs % 24}h`;
+  if (hrs > 0) return `${hrs}h ${mins % 60}m`;
+  return `${mins}m`;
+}
+
+function statusText(status) {
+  if (status === 'online') return 'online';
+  if (status === 'stale') return 'stale';
+  if (status === 'offline') return 'offline';
+  return 'unknown';
+}
+
+function findCard(id) {
+  return Array.from(document.querySelectorAll('.dev')).find(el => el.dataset.id === id);
+}
+
+function setActive(id) {
+  activeId = id;
+  document.querySelectorAll('.dev').forEach(el => el.classList.toggle('active', el.dataset.id === id));
+  $('detail').hidden = false;
+  updateDetail();
+  redrawChart();
+  loadHistory(id);
+}
+
+function renderCard(id) {
+  const d = devices[id];
+  if (!d) return;
+  let el = findCard(id);
+  if (!el) {
+    el = document.createElement('button');
+    el.type = 'button';
+    el.className = 'dev';
+    el.dataset.id = id;
+    el.onclick = () => setActive(id);
+    $('grid').appendChild(el);
+  }
+  const name = escapeHtml(id);
+  const tStr = isNaN(d.temp) ? '--.-' : d.temp.toFixed(1);
+  const hStr = isNaN(d.hum) ? '--' : Math.round(d.hum);
+  const ipStr = d.ip ? `<a class="tag link" href="http://${escapeHtml(d.ip)}/" target="_blank" rel="noopener" onclick="event.stopPropagation()">${escapeHtml(d.ip)}</a>` : '';
+  el.innerHTML = `
+    <div class="dev-top"><span class="dev-name">${name}</span><span class="dot"></span></div>
+    <div class="values">
+      <div class="reading temp"><span>Temp</span><b>${tStr}<small>°C</small></b></div>
+      <div class="reading hum"><span>Hum</span><b>${hStr}<small>%</small></b></div>
+    </div>
+    <div class="dev-meta">
+      <span class="tag">${statusText(d.status)}</span>
+      <span class="tag">${fmtAge(d.lastTs)}</span>
+      ${d.rssi != null ? `<span class="tag">${escapeHtml(d.rssi)} dBm</span>` : ''}
+      ${ipStr}
+    </div>
+  `;
+  el.classList.toggle('stale', d.status === 'stale');
+  el.classList.toggle('off', d.status === 'offline');
+  el.classList.toggle('active', activeId === id);
+}
+
+function updateDetail() {
+  const d = devices[activeId];
+  if (!d) return;
+  $('detailTitle').textContent = d.id;
+  $('detailStatus').textContent = statusText(d.status);
+  $('dTemp').textContent = isNaN(d.temp) ? '--' : d.temp.toFixed(1);
+  $('dHum').textContent = isNaN(d.hum) ? '--' : Math.round(d.hum);
+  $('dIp').innerHTML = d.ip ? `<a class="ip-link" href="http://${escapeHtml(d.ip)}/" target="_blank" rel="noopener">${escapeHtml(d.ip)}</a>` : '--';
+  $('dRssi').textContent = d.rssi != null ? d.rssi + ' dBm' : '--';
+  $('dUptime').textContent = fmtUptime(d.uptime);
+  $('dFw').textContent = d.fw || '--';
+  $('dLast').textContent = fmtAge(d.lastTs);
+}
+
+// --- View controls (client-side search / sort / filter) ------------------
+const view = { query: '', status: 'all', sort: 'name' };
+
+function statusRank(d) {
+  return ({ online: 0, stale: 1, unknown: 2, offline: 3 })[d.status] ?? 2;
+}
+
+function applyGridView() {
+  const grid = $('grid');
+  const ids = Object.keys(devices);
+  const q = view.query.toLowerCase();
+
+  ids.forEach(id => {
+    const card = findCard(id);
+    if (!card) return;
+    const d = devices[id];
+    const matchesQuery = !q || id.toLowerCase().includes(q);
+    const matchesStatus =
+      view.status === 'all' ||
+      (view.status === 'online' && d.status === 'online') ||
+      (view.status === 'stale'  && d.status === 'stale') ||
+      (view.status === 'off'    && d.status === 'offline');
+    card.classList.toggle('hidden', !(matchesQuery && matchesStatus));
+  });
+
+  const sorted = ids.slice().sort((a, b) => {
+    const da = devices[a], db = devices[b];
+    switch (view.sort) {
+      case 'temp-desc': {
+        const ta = isNaN(da.temp) ? -Infinity : da.temp;
+        const tb = isNaN(db.temp) ? -Infinity : db.temp;
+        if (tb !== ta) return tb - ta;
+        return a.localeCompare(b);
+      }
+      case 'temp-asc': {
+        const ta = isNaN(da.temp) ?  Infinity : da.temp;
+        const tb = isNaN(db.temp) ?  Infinity : db.temp;
+        if (ta !== tb) return ta - tb;
+        return a.localeCompare(b);
+      }
+      case 'status': {
+        const r = statusRank(da) - statusRank(db);
+        return r !== 0 ? r : a.localeCompare(b);
+      }
+      case 'recent': {
+        const r = (db.lastTs || 0) - (da.lastTs || 0);
+        return r !== 0 ? r : a.localeCompare(b);
+      }
+      default: return a.localeCompare(b);
+    }
+  });
+  sorted.forEach(id => { const card = findCard(id); if (card) grid.appendChild(card); });
+
+  const total = ids.length;
+  const visible = ids.reduce((n, id) => {
+    const c = findCard(id);
+    return n + (c && !c.classList.contains('hidden') ? 1 : 0);
+  }, 0);
+  grid.classList.toggle('no-matches', total > 0 && visible === 0);
+  const hint = $('deviceHint');
+  if (total === 0) hint.textContent = 'Waiting for data';
+  else if (visible === total) hint.textContent = `${total} configured or discovered`;
+  else hint.textContent = `${visible} of ${total} shown`;
+}
+
+$('qSearch').addEventListener('input', e => { view.query = e.target.value.trim(); applyGridView(); });
+$('qSort').addEventListener('change', e => { view.sort = e.target.value; applyGridView(); });
+document.querySelectorAll('.chip[data-filter]').forEach(btn => {
+  btn.addEventListener('click', () => {
+    view.status = btn.dataset.filter;
+    document.querySelectorAll('.chip[data-filter]').forEach(b => b.classList.toggle('on', b === btn));
+    applyGridView();
+  });
+});
+
+setInterval(() => {
+  $('clock').textContent = new Date().toLocaleString([], { dateStyle:'medium', timeStyle:'medium' });
+}, 1000);
+$('clock').textContent = new Date().toLocaleString([], { dateStyle:'medium', timeStyle:'medium' });
+
+// --- Chart ----------------------------------------------------------------
+const chart = new Chart($('chart').getContext('2d'), {
+  type: 'line',
+  data: { labels: [], datasets: [
+    { label:'Temp (°C)', data:[], borderColor:'#f28c6b', backgroundColor:'rgba(242,140,107,.12)', pointRadius:0, borderWidth:2, tension:.28, yAxisID:'y' },
+    { label:'Humidity (%)', data:[], borderColor:'#88d1c9', backgroundColor:'rgba(136,209,201,.12)', pointRadius:0, borderWidth:2, tension:.28, yAxisID:'y1' },
+  ]},
+  options: {
+    responsive:true,
+    maintainAspectRatio:false,
+    animation:false,
+    interaction:{ intersect:false, mode:'index' },
+    scales: {
+      x:{ ticks:{color:'#9aa7b7', maxTicksLimit:6}, grid:{color:'rgba(43,52,68,.7)'} },
+      y:{ position:'left', ticks:{color:'#f28c6b'}, grid:{color:'rgba(43,52,68,.7)'}, title:{display:true,text:'°C',color:'#f28c6b'} },
+      y1:{ position:'right', ticks:{color:'#88d1c9'}, grid:{display:false}, title:{display:true,text:'%',color:'#88d1c9'} },
+    },
+    plugins:{ legend:{ labels:{ color:'#edf1f5', boxWidth:10, boxHeight:10 } } }
+  }
+});
+
+function redrawChart() {
+  const d = devices[activeId];
+  if (!d) return;
+  const h = d.history || [];
+  chart.data.labels = h.map(p => new Date(p.t).toLocaleTimeString());
+  chart.data.datasets[0].data = h.map(p => p.T);
+  chart.data.datasets[1].data = h.map(p => p.H);
+  chart.update();
+}
+
+function appendChartPoint(t, T, H) {
+  chart.data.labels.push(new Date(t).toLocaleTimeString());
+  chart.data.datasets[0].data.push(T);
+  chart.data.datasets[1].data.push(isNaN(H) ? null : H);
+  if (chart.data.labels.length > 300) {
+    chart.data.labels.shift();
+    chart.data.datasets.forEach(s => s.data.shift());
+  }
+  chart.update();
+}
+
+async function loadHistory(id) {
+  try {
+    const r = await fetch(`/api/history?device=${encodeURIComponent(id)}`);
+    const arr = await r.json();
+    if (Array.isArray(arr) && devices[id]) {
+      devices[id].history = arr.map(p => ({ t: p.t, T: p.T, H: p.H }));
+    }
+  } catch (e) {
+    console.warn('history fetch failed', e);
+  }
+  if (activeId === id) redrawChart();
+}
+
+// --- MQTT status pill -----------------------------------------------------
+function setMqttPill(text, cls) {
+  const p = $('mqttPill');
+  p.innerHTML = `<span>MQTT</span><strong>${escapeHtml(text)}</strong>`;
+  p.classList.remove('ok','bad');
+  if (cls) p.classList.add(cls);
+}
+
+// --- Snapshot handling ----------------------------------------------------
+function applySnapshot(snap) {
+  serverNow = snap.now || Date.now();
+  serverNowAtClient = Date.now();
+
+  const cls = snap.mqtt === 'connected' ? 'ok'
+            : (snap.mqtt === 'disconnected' || snap.mqtt === 'error') ? 'bad' : null;
+  setMqttPill(snap.mqtt || 'unknown', cls);
+  $('baseTopic').textContent = snap.base || 'room';
+
+  const seen = new Set();
+  (snap.devices || []).forEach(sd => {
+    seen.add(sd.id);
+    let d = devices[sd.id];
+    if (!d) d = devices[sd.id] = { id: sd.id, history: [], lastTs: 0 };
+    const prevTs = d.lastTs || 0;
+    d.temp   = sd.temp == null ? NaN : sd.temp;
+    d.hum    = sd.hum == null ? NaN : sd.hum;
+    d.rssi   = sd.rssi;
+    d.uptime = sd.uptime;
+    d.ip     = sd.ip || null;
+    d.fw     = sd.fw || null;
+    d.lastTs = sd.lastTs || 0;
+    d.status = sd.status;
+    // New reading since last snapshot: extend local history + live chart.
+    if (d.lastTs > prevTs && prevTs > 0 && !isNaN(d.temp)) {
+      d.history.push({ t: d.lastTs, T: d.temp, H: isNaN(d.hum) ? null : d.hum });
+      if (d.history.length > 300) d.history.shift();
+      if (activeId === sd.id) appendChartPoint(d.lastTs, d.temp, d.hum);
+    }
+    renderCard(sd.id);
+  });
+
+  // Drop devices the server no longer reports.
+  Object.keys(devices).forEach(id => {
+    if (seen.has(id)) return;
+    const c = findCard(id);
+    if (c) c.remove();
+    delete devices[id];
+    if (activeId === id) { activeId = null; $('detail').hidden = true; }
+  });
+
+  const s = snap.summary || {};
+  $('countPill').innerHTML = `<span>Devices</span><strong>${s.total || 0}</strong>`;
+  $('sOnline').textContent = s.online || 0;
+  $('sTemp').textContent = s.avgTemp == null ? '--' : s.avgTemp.toFixed(1);
+  $('sHum').textContent  = s.avgHum == null ? '--' : Math.round(s.avgHum);
+  $('sMinMax').textContent = (s.minTemp == null || s.maxTemp == null)
+    ? '--' : `${s.minTemp.toFixed(1)} / ${s.maxTemp.toFixed(1)} °C`;
+
+  // Auto-open the first device that has data.
+  if (!activeId) {
+    const first = (snap.devices || []).find(d => d.lastTs > 0);
+    if (first) setActive(first.id);
+  } else {
+    updateDetail();
+  }
+  applyGridView();
+}
+
+// --- Connect to the server's SSE stream -----------------------------------
+function connect() {
+  const es = new EventSource('/events');
+  es.onmessage = e => {
+    try { applySnapshot(JSON.parse(e.data)); }
+    catch (err) { console.warn('bad snapshot', err); }
+  };
+  es.onerror = () => setMqttPill('reconnecting...', null); // EventSource retries automatically
+}
+
+connect();
+</script>
+</body>
+</html>

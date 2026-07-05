@@ -120,13 +120,17 @@ On first boot the device creates the AP **`RoomTemp-Setup`**. Connect, open `htt
 - **GScript path** — `/macros/s/<DEPLOYMENT_ID>/exec`
 - **Device ID** — **must be unique per board**, e.g. `room1` … `room10`
 
-Settings persist in EEPROM. To re-run the portal: hit `http://<device-ip>/reset` or hold FLASH at boot.
+Settings persist in EEPROM. To re-run the portal: `POST` to `http://<device-ip>/reset` (admin auth required) or hold FLASH at boot (5 s long-press also wipes Wi-Fi at runtime).
 
 Local endpoints once connected:
 
 - `http://<ip>/` — small status page (auto-refreshing)
-- `http://<ip>/api` — JSON `{device, temp, hum, rssi, uptime, mqtt}`
-- `http://<ip>/reset` — wipe Wi-Fi creds and reboot
+- `http://<ip>/api` — JSON `{device, temp, hum, rssi, ip, uptime, mqtt, fw}`
+- `http://<ip>/config` — settings form (admin auth; GET to view, POST to save)
+- `http://<ip>/metrics` — JSON diagnostics: boots, reconnects, sensor faults, heap (admin auth)
+- `POST http://<ip>/reset` — wipe Wi-Fi creds and reboot (admin auth)
+
+Write endpoints (`/config/save`, `/reset`, `/metrics`) use HTTP Basic auth — user `admin`, password from the `/config` **Admin password** field, falling back to `OTA_PASSWORD`.
 
 ## 3. HiveMQ Cloud
 
