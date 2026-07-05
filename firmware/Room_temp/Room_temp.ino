@@ -25,6 +25,7 @@
  */
 
 #include <ESP8266WiFi.h>
+#include <ESP8266WiFiMulti.h>
 #include <ESP8266WebServer.h>
 #include <WiFiClientSecureBearSSL.h>
 #include <ESP8266HTTPClient.h>
@@ -41,7 +42,32 @@
 #include <EEPROM.h>
 #include "secrets.h"
 
-#define FW_VERSION "1.4.0"
+#define FW_VERSION "1.5.0"
+
+// Optional compiled-in Wi-Fi defaults. Define any of these in secrets.h to
+// pre-load known networks on every unit; leave undefined for portal-only setup.
+// WiFiMulti auto-connects to whichever configured network is strongest/in range.
+#ifndef DEFAULT_WIFI1_SSID
+#define DEFAULT_WIFI1_SSID ""
+#endif
+#ifndef DEFAULT_WIFI1_PASS
+#define DEFAULT_WIFI1_PASS ""
+#endif
+#ifndef DEFAULT_WIFI2_SSID
+#define DEFAULT_WIFI2_SSID ""
+#endif
+#ifndef DEFAULT_WIFI2_PASS
+#define DEFAULT_WIFI2_PASS ""
+#endif
+#ifndef DEFAULT_WIFI3_SSID
+#define DEFAULT_WIFI3_SSID ""
+#endif
+#ifndef DEFAULT_WIFI3_PASS
+#define DEFAULT_WIFI3_PASS ""
+#endif
+
+// Number of stored Wi-Fi networks tried at boot (slot 0 = primary/scan-picked).
+#define WIFI_SLOTS 3
 
 // ---------------- Pins ----------------
 //   GPIO2  = D4 (also onboard LED on most dev boards)
@@ -72,6 +98,12 @@ char gs_path[140]      = DEFAULT_GS_PATH;
 char project_id[24]    = DEFAULT_PROJECT;
 char device_id[24]     = DEFAULT_DEVICE_ID;
 
+// Up to WIFI_SLOTS saved networks. Slot 0 is the primary (set via the portal's
+// Wi-Fi scanner); slots 1..2 are extras typed in the portal / /config page.
+// WiFiMulti connects to whichever is in range with the strongest signal.
+char wifi_ssid[WIFI_SLOTS][33] = { DEFAULT_WIFI1_SSID, DEFAULT_WIFI2_SSID, DEFAULT_WIFI3_SSID };
+char wifi_pass[WIFI_SLOTS][65] = { DEFAULT_WIFI1_PASS, DEFAULT_WIFI2_PASS, DEFAULT_WIFI3_PASS };
+
 // Per-device calibration. Added to raw DHT reading before publish/display.
 // Editable in /config after comparing against a reference thermometer.
 float temp_offset = 0.0f;
@@ -99,9 +131,13 @@ struct Config {
   float temp_offset;
   float hum_offset;
   char  admin_pass[24];
+  // v3 additions:
+  char  wifi_ssid[WIFI_SLOTS][33];
+  char  wifi_pass[WIFI_SLOTS][65];
 } cfg;
 const uint32_t CFG_MAGIC_V1 = 0xC0FFEE05;
 const uint32_t CFG_MAGIC_V2 = 0xC0FFEE06;
+const uint32_t CFG_MAGIC_V3 = 0xC0FFEE07;
 
 // ESP8266 has ~512 B of RTC user memory that survives soft reboots
 // (not power-cycle). Used for boot/reconnect/fault counters so we don't
@@ -142,6 +178,13 @@ void loadConfig() {
     migrated = true;
   }
   if (cfg.magic == CFG_MAGIC_V1 || cfg.magic == CFG_MAGIC_V2) {
+    // v3 adds the Wi-Fi slots. Seed them from the compiled-in secrets.h
+    // defaults so an OTA upgrade keeps any known networks baked into firmware.
+    memcpy(cfg.wifi_ssid, wifi_ssid, sizeof(cfg.wifi_ssid));
+    memcpy(cfg.wifi_pass, wifi_pass, sizeof(cfg.wifi_pass));
+    migrated = true;
+  }
+  if (cfg.magic == CFG_MAGIC_V1 || cfg.magic == CFG_MAGIC_V2 || cfg.magic == CFG_MAGIC_V3) {
     strncpy(mqtt_server, cfg.mqtt_server, sizeof(mqtt_server));
     strncpy(mqtt_port_s, cfg.mqtt_port_s, sizeof(mqtt_port_s));
     strncpy(mqtt_user,   cfg.mqtt_user,   sizeof(mqtt_user));
@@ -154,12 +197,14 @@ void loadConfig() {
     temp_offset = cfg.temp_offset;
     hum_offset  = cfg.hum_offset;
     strncpy(admin_pass,  cfg.admin_pass,  sizeof(admin_pass));
+    memcpy(wifi_ssid, cfg.wifi_ssid, sizeof(wifi_ssid));
+    memcpy(wifi_pass, cfg.wifi_pass, sizeof(wifi_pass));
   }
   if (migrated) saveConfig();
 }
 
 void saveConfig() {
-  cfg.magic = CFG_MAGIC_V2;
+  cfg.magic = CFG_MAGIC_V3;
   strncpy(cfg.mqtt_server, mqtt_server, sizeof(cfg.mqtt_server));
   strncpy(cfg.mqtt_port_s, mqtt_port_s, sizeof(cfg.mqtt_port_s));
   strncpy(cfg.mqtt_user,   mqtt_user,   sizeof(cfg.mqtt_user));
@@ -172,6 +217,8 @@ void saveConfig() {
   cfg.temp_offset = temp_offset;
   cfg.hum_offset  = hum_offset;
   strncpy(cfg.admin_pass,  admin_pass,  sizeof(cfg.admin_pass));
+  memcpy(cfg.wifi_ssid, wifi_ssid, sizeof(cfg.wifi_ssid));
+  memcpy(cfg.wifi_pass, wifi_pass, sizeof(cfg.wifi_pass));
   EEPROM.begin(sizeof(Config));
   EEPROM.put(0, cfg);
   EEPROM.commit();
@@ -186,6 +233,7 @@ DHT dht(DHT_PIN, DHT_TYPE);
 ESP8266WebServer server(80);
 BearSSL::WiFiClientSecure secureClient;
 PubSubClient mqtt(secureClient);
+ESP8266WiFiMulti wifiMulti;
 
 float lastTemp = NAN;
 float lastHum  = NAN;
@@ -194,6 +242,7 @@ unsigned long lastPubMs       = 0;
 unsigned long lastSheetMs     = 0;
 unsigned long lastReconnMs    = 0;
 unsigned long lastValidReadMs = 0;
+unsigned long lastWifiOkMs    = 0;   // for runtime Wi-Fi failover throttling
 unsigned long lastShiftMs     = 0;
 bool sensorReinited = false;
 bool needPublishNow = false;
@@ -311,7 +360,22 @@ void sensorWatchdog() {
 }
 
 // ---------------- Wi-Fi / Portal ----------------
-void startPortal(bool forceConfig) {
+// Register every non-empty saved network with WiFiMulti, plus whatever the
+// SDK persisted (covers pre-1.5 firmware where the slots may be blank but a
+// primary AP is still stored in flash). WiFiMulti then connects to the
+// strongest of them and can fail over between them.
+void buildWifiList() {
+  for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
+    if (wifi_ssid[i][0]) wifiMulti.addAP(wifi_ssid[i], wifi_pass[i]);
+  }
+  String saved = WiFi.SSID();
+  if (saved.length()) wifiMulti.addAP(saved.c_str(), WiFi.psk().c_str());
+}
+
+// Runs the WiFiManager captive portal (always in config mode). The built-in
+// scanner picks the primary network; extra networks are typed into custom
+// fields. Blocks until the user saves or the portal times out.
+void startPortal() {
   WiFiManager wm;
   wm.setSaveConfigCallback(saveConfigCallback);
 
@@ -324,6 +388,10 @@ void startPortal(bool forceConfig) {
   WiFiManagerParameter p_gs_path    ("gsp",   "GScript path",  gs_path, 140);
   WiFiManagerParameter p_proj       ("prj",   "Project (sheet tab)", project_id, 24);
   WiFiManagerParameter p_dev        ("dev",   "Room name (device ID)", device_id, 24);
+  WiFiManagerParameter p_w2_ssid    ("w2s",   "Wi-Fi #2 SSID (optional)", wifi_ssid[1], 32);
+  WiFiManagerParameter p_w2_pass    ("w2p",   "Wi-Fi #2 password",        wifi_pass[1], 64);
+  WiFiManagerParameter p_w3_ssid    ("w3s",   "Wi-Fi #3 SSID (optional)", wifi_ssid[2], 32);
+  WiFiManagerParameter p_w3_pass    ("w3p",   "Wi-Fi #3 password",        wifi_pass[2], 64);
 
   wm.addParameter(&p_mqtt_server);
   wm.addParameter(&p_mqtt_port);
@@ -334,13 +402,16 @@ void startPortal(bool forceConfig) {
   wm.addParameter(&p_gs_path);
   wm.addParameter(&p_proj);
   wm.addParameter(&p_dev);
+  wm.addParameter(&p_w2_ssid);
+  wm.addParameter(&p_w2_pass);
+  wm.addParameter(&p_w3_ssid);
+  wm.addParameter(&p_w3_pass);
 
   oledMsg("WiFi Setup", "AP: RoomTemp-Setup", "192.168.4.1");
 
-  bool ok;
-  if (forceConfig) ok = wm.startConfigPortal("RoomTemp-Setup");
-  else             ok = wm.autoConnect("RoomTemp-Setup");
-
+  // Always config mode: ensureWifi() only calls us when we actually need the
+  // portal (multi-connect failed or the FLASH button forced it).
+  bool ok = wm.startConfigPortal("RoomTemp-Setup");
   if (!ok) {
     oledMsg("WiFi failed", "Restarting...");
     delay(1500); ESP.restart();
@@ -356,8 +427,47 @@ void startPortal(bool forceConfig) {
     strncpy(gs_path,     p_gs_path.getValue(),     sizeof(gs_path));
     strncpy(project_id,  p_proj.getValue(),        sizeof(project_id));
     strncpy(device_id,   p_dev.getValue(),         sizeof(device_id));
-    saveConfig();
+    strncpy(wifi_ssid[1], p_w2_ssid.getValue(), sizeof(wifi_ssid[1]));
+    strncpy(wifi_pass[1], p_w2_pass.getValue(), sizeof(wifi_pass[1]));
+    strncpy(wifi_ssid[2], p_w3_ssid.getValue(), sizeof(wifi_ssid[2]));
+    strncpy(wifi_pass[2], p_w3_pass.getValue(), sizeof(wifi_pass[2]));
+    wifi_ssid[1][sizeof(wifi_ssid[1]) - 1] = '\0';
+    wifi_pass[1][sizeof(wifi_pass[1]) - 1] = '\0';
+    wifi_ssid[2][sizeof(wifi_ssid[2]) - 1] = '\0';
+    wifi_pass[2][sizeof(wifi_pass[2]) - 1] = '\0';
   }
+
+  // The portal just associated with the primary AP; capture those creds into
+  // slot 0 so WiFiMulti can auto-connect to it (or fail over) next boot.
+  String primarySsid = WiFi.SSID();
+  if (primarySsid.length()) {
+    strncpy(wifi_ssid[0], primarySsid.c_str(), sizeof(wifi_ssid[0]));
+    wifi_ssid[0][sizeof(wifi_ssid[0]) - 1] = '\0';
+    String primaryPsk = WiFi.psk();
+    strncpy(wifi_pass[0], primaryPsk.c_str(), sizeof(wifi_pass[0]));
+    wifi_pass[0][sizeof(wifi_pass[0]) - 1] = '\0';
+  }
+  saveConfig();
+}
+
+// Bring Wi-Fi up. Normal boot: try every saved network via WiFiMulti and
+// return once connected. If none are reachable (or the FLASH button forced
+// it), fall back to the captive portal.
+void ensureWifi(bool forcePortal) {
+  if (!forcePortal) {
+    WiFi.mode(WIFI_STA);
+    buildWifiList();
+    oledMsg("WiFi", "Connecting...");
+    unsigned long t0 = millis();
+    while (millis() - t0 < 25000UL) {
+      if (wifiMulti.run() == WL_CONNECTED) return;
+      delay(300);
+    }
+    if (WiFi.status() == WL_CONNECTED) return;
+    Serial.println("No known Wi-Fi in range; opening portal");
+  }
+  startPortal();
+  buildWifiList();   // refresh list with any networks changed in the portal
 }
 
 // ---------------- MQTT ----------------
@@ -576,7 +686,7 @@ void handleMetrics() {
 void handleConfigPage() {
   if (!requireAuth()) return;
   String html;
-  html.reserve(6800);
+  html.reserve(8200);
   html += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>Room Temp Config</title><style>");
   html += F(":root{--bg:#0f1218;--panel:#171c25;--line:#2b3444;--text:#edf1f5;--mut:#9aa7b7;--acc:#9fb8ff}");
@@ -598,6 +708,19 @@ void handleConfigPage() {
   html += F("<label>MQTT base topic<input name='mqtt_base' maxlength='39' value='"); html += htmlEscape(mqtt_base); html += F("'></label>");
   html += F("<label>Google Script host<input name='gs_host' maxlength='79' value='"); html += htmlEscape(gs_host); html += F("'></label>");
   html += F("</div><label>Google Script path<input name='gs_path' maxlength='139' value='"); html += htmlEscape(gs_path); html += F("'></label>");
+  html += F("<p style='color:var(--text);margin:14px 0 0'>Wi-Fi networks <small style='color:var(--mut)'>&mdash; auto-connects to the strongest in range</small></p><div class='grid'>");
+  char wn[8];
+  for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
+    html += F("<label>SSID #"); html += String(i + 1);
+    snprintf(wn, sizeof(wn), "w%u_ssid", i);
+    html += F("<input name='"); html += wn; html += F("' maxlength='32' value='");
+    html += htmlEscape(wifi_ssid[i]); html += F("'></label>");
+    html += F("<label>Password #"); html += String(i + 1);
+    html += F("<small>Blank = keep current</small>");
+    snprintf(wn, sizeof(wn), "w%u_pass", i);
+    html += F("<input name='"); html += wn; html += F("' maxlength='64' type='password'></label>");
+  }
+  html += F("</div>");
   char off[16];
   html += F("<div class='grid'>");
   snprintf(off, sizeof(off), "%.2f", temp_offset);
@@ -627,6 +750,15 @@ void handleConfigSave() {
   if (server.hasArg("hum_offset"))  hum_offset  = server.arg("hum_offset").toFloat();
   if (server.hasArg("admin_pass") && server.arg("admin_pass").length() > 0) {
     server.arg("admin_pass").toCharArray(admin_pass, sizeof(admin_pass));
+  }
+  char wn[8];
+  for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
+    snprintf(wn, sizeof(wn), "w%u_ssid", i);
+    copyArg(wifi_ssid[i], sizeof(wifi_ssid[i]), wn);   // SSID: blank clears the slot
+    snprintf(wn, sizeof(wn), "w%u_pass", i);
+    if (server.hasArg(wn) && server.arg(wn).length() > 0) {
+      server.arg(wn).toCharArray(wifi_pass[i], sizeof(wifi_pass[i]));
+    }
   }
   saveConfig();
   server.send(200, "text/html", "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body style='font-family:system-ui;background:#0f1218;color:#edf1f5;padding:2rem'><h1>Saved</h1><p>Restarting device...</p></body>");
@@ -689,7 +821,7 @@ void setup() {
 
   pinMode(BOOT_BTN, INPUT_PULLUP);
   bool force = (digitalRead(BOOT_BTN) == LOW);
-  startPortal(force);
+  ensureWifi(force);
 
   oledMsg("WiFi OK", WiFi.SSID(), WiFi.localIP().toString());
   Serial.print("IP: "); Serial.println(WiFi.localIP());
@@ -742,6 +874,17 @@ void loop() {
   mqtt.loop();
 
   unsigned long now = millis();
+
+  // Runtime Wi-Fi failover: the SDK auto-reconnects to the same AP, but if
+  // that AP stays down for 30 s, re-run WiFiMulti to switch to another saved
+  // network that's in range. Throttled so the blocking scan runs at most
+  // once every 30 s while disconnected.
+  if (WiFi.status() == WL_CONNECTED) {
+    lastWifiOkMs = now;
+  } else if (now - lastWifiOkMs > 30000UL) {
+    lastWifiOkMs = now;
+    wifiMulti.run();
+  }
 
   if (now - lastShiftMs > SHIFT_INTERVAL) {
     lastShiftMs = now;

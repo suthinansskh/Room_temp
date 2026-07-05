@@ -10,7 +10,7 @@ DHT11 ─► ESP8266 #2 ───►│  HiveMQ     │◄── WSS ──► G
 DHT11 ─► ESP8266 #10───►│  (MQTT TLS) │
                         └─────────────┘
               │
-              │ HTTPS (every 60 s, per device)
+              │ HTTPS (every 30 min, per device)
               ▼
         Google Apps Script  ──►  Google Sheet (timestamp, device, temp, hum, rssi)
 ```
@@ -110,7 +110,7 @@ pio run -e d1_mini   -t upload
 
 ### First boot (either toolchain)
 
-On first boot the device creates the AP **`RoomTemp-Setup`**. Connect, open `http://192.168.4.1`, pick your Wi-Fi, and fill in:
+On first boot the device creates the AP **`RoomTemp-Setup`**. Connect, open `http://192.168.4.1`, pick your primary Wi-Fi (**Wi-Fi #1**), and fill in:
 
 - **MQTT host** — your HiveMQ cluster, e.g. `xxxxx.s1.eu.hivemq.cloud`
 - **MQTT port** — `8883`
@@ -119,6 +119,21 @@ On first boot the device creates the AP **`RoomTemp-Setup`**. Connect, open `htt
 - **GScript host** — leave as `script.google.com`
 - **GScript path** — `/macros/s/<DEPLOYMENT_ID>/exec`
 - **Device ID** — **must be unique per board**, e.g. `room1` … `room10`
+- **Wi-Fi #2 / #3 (optional)** — extra SSID + password fields for fallback networks
+
+### Multi-network auto-connect
+
+Each board can store **up to 3 Wi-Fi networks**. At boot it uses `ESP8266WiFiMulti`
+to scan and connect to whichever configured network is **in range with the strongest
+signal** — no manual selection needed. If the active AP goes down for 30 s at runtime,
+it re-scans and fails over to another saved network automatically. If *none* of the
+saved networks are reachable, it falls back to the `RoomTemp-Setup` captive portal.
+
+Set the networks any of three ways:
+
+- **Captive portal** — Wi-Fi #1 via the built-in scanner, #2/#3 via the extra fields.
+- **`/config` page** — edit all three SSID/password slots on a running device (clear an SSID to disable that slot).
+- **Compile-time defaults** — `DEFAULT_WIFI{1,2,3}_SSID/PASS` in `secrets.h`, so a whole fleet ships pre-loaded with the known office APs (see [secrets.h.example](firmware/Room_temp/secrets.h.example)).
 
 Settings persist in EEPROM. To re-run the portal: `POST` to `http://<device-ip>/reset` (admin auth required) or hold FLASH at boot (5 s long-press also wipes Wi-Fi at runtime).
 
@@ -242,7 +257,7 @@ Tips:
 - Use the **same MQTT user/pass** on all 10 boards; only `device_id` differs.
 - Stagger first-power-on by a few seconds so the broker doesn't see 10 simultaneous TLS handshakes.
 - DHT11 accuracy is ±2 °C / ±5 % RH; for tighter readings swap to DHT22 (same wiring, change `DHT_TYPE` in the sketch).
-- The Google Sheet receives **one row per device per minute** = 10 rows/min = 14 400 rows/day. After ~1 month rotate to a new sheet or summarise daily.
+- The Google Sheet receives **one row per device every 30 min** (plus one immediate row on boot) = 2 rows/device/hour = 10 devices × 48/day ≈ 480 rows/day. Sheets logging cadence is set by `SHEET_INTERVAL` in the firmware.
 - Bandwidth: each MQTT message ≈ 120 B, 10 devices × every 10 s ≈ 1 KB/s — well inside the HiveMQ free tier.
 
 ## 7. Troubleshooting
