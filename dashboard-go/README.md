@@ -75,7 +75,7 @@ go build -o dashboard.exe .
   min/max limits are per-browser display state kept in `localStorage`.
 - The page loads Tailwind, Sarabun, and Font Awesome from public CDNs; a display
   with no internet access needs those three assets vendored into `web/`.
-- Per-device monitoring can be switched off from the card (⏻) or the device
+- Per-device monitoring is switched off in the sidebar's **เปิด/ปิดใช้งานอุปกรณ์**
   dialog. That is a browser-side display state: the server keeps ingesting and
   the device keeps publishing — the card just stops counting toward the status
   tiles, averages, alerts, and the monthly report.

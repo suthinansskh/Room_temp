@@ -169,6 +169,12 @@
       <span class="text-sm">รายงานรายเดือน</span>
     </button>
 
+    <button onclick="openDevicesModal()" class="side-btn">
+      <i class="fa-solid fa-toggle-on w-5 text-center text-slate-400"></i>
+      <span class="text-sm">เปิด/ปิดใช้งานอุปกรณ์</span>
+      <span id="sidebar-disabled-badge" class="ml-auto bg-slate-400 text-white text-[10px] font-bold px-1.5 py-0.5 rounded-md hidden">0</span>
+    </button>
+
     <button onclick="exportCSV()" class="side-btn">
       <i class="fa-solid fa-file-csv w-5 text-center text-slate-400"></i>
       <span class="text-sm">ส่งออกข้อมูล (Export)</span>
@@ -466,11 +472,6 @@
         <input id="dev-cfg-zone" class="field" placeholder="เช่น อาคาร A" list="zone-list" />
         <datalist id="zone-list"></datalist>
       </div>
-      <label class="flex items-center gap-3 card p-3 cursor-pointer">
-        <input type="checkbox" id="dev-cfg-enabled" class="w-4 h-4 accent-moph-600 shrink-0" checked />
-        <span class="text-sm font-bold text-slate-700 dark:text-slate-200">เปิดใช้งานการเฝ้าระวัง</span>
-        <span class="ml-auto text-[10px] text-slate-400 text-right leading-tight">ปิดไว้ตอนถอดเซ็นเซอร์/ซ่อมบำรุง<br>จะไม่นับในสถิติและไม่แจ้งเตือน</span>
-      </label>
       <div class="grid grid-cols-2 gap-3">
         <div><label class="lbl" for="dev-cfg-min">อุณหภูมิต่ำสุด (Min °C)</label><input id="dev-cfg-min" type="number" step="0.1" class="field tabular-nums" /></div>
         <div><label class="lbl" for="dev-cfg-max">อุณหภูมิสูงสุด (Max °C)</label><input id="dev-cfg-max" type="number" step="0.1" class="field tabular-nums" /></div>
@@ -480,6 +481,30 @@
     <div class="modal-foot flex gap-2">
       <button onclick="saveDeviceSettings()" class="btn-primary flex-1 bg-amber-500 hover:bg-amber-600">บันทึกการตั้งค่า</button>
       <button onclick="closeDeviceSettingsModal()" class="btn-ghost">ยกเลิก</button>
+    </div>
+  </div>
+</div>
+
+<!-- Device on/off modal -->
+<div id="devices-modal" class="modal">
+  <div class="modal-panel max-w-lg">
+    <div class="modal-head justify-between">
+      <div class="flex items-center gap-3 min-w-0">
+        <div class="modal-icon bg-moph-100 dark:bg-moph-900/50 text-moph-600 dark:text-moph-300"><i class="fa-solid fa-toggle-on"></i></div>
+        <div class="min-w-0">
+          <h3 class="text-lg font-bold text-slate-800 dark:text-slate-100">เปิด/ปิดใช้งานอุปกรณ์</h3>
+          <p class="text-xs text-slate-500 dark:text-slate-400">ที่ปิดไว้จะไม่นับในสถิติ ไม่แจ้งเตือน และไม่เข้ารายงาน</p>
+        </div>
+      </div>
+      <button onclick="closeDevicesModal()" class="w-8 h-8 rounded-full bg-slate-200 dark:bg-slate-700 hover:bg-slate-300 dark:hover:bg-slate-600 text-slate-600 dark:text-slate-200 flex items-center justify-center transition-colors shrink-0">
+        <i class="fa-solid fa-xmark"></i>
+      </button>
+    </div>
+    <div id="devices-list" class="p-4 overflow-y-auto divide-y divide-slate-100 dark:divide-slate-800"></div>
+    <div class="modal-foot flex gap-2">
+      <button onclick="setAllDevices(true)" class="btn-ghost flex-1"><i class="fa-solid fa-circle-check text-moph-600"></i> เปิดทั้งหมด</button>
+      <button onclick="setAllDevices(false)" class="btn-ghost flex-1"><i class="fa-solid fa-ban text-slate-400"></i> ปิดทั้งหมด</button>
+      <button onclick="closeDevicesModal()" class="btn-primary px-6">เสร็จสิ้น</button>
     </div>
   </div>
 </div>
@@ -909,7 +934,6 @@ function renderCard(id) {
       '</div>' +
       '<div class="flex items-center gap-1 shrink-0">' +
         (d.ip ? '<a href="http://' + escapeHtml(d.ip) + '/" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="' + escapeHtml(d.ip) + '" class="icon-btn hover:bg-sky-100 hover:text-sky-600"><i class="fa-solid fa-globe text-[11px]"></i></a>' : '') +
-        '<button onclick="event.stopPropagation(); toggleDevice(\'' + escapeHtml(id) + '\')" title="' + (st === 'disabled' ? 'เปิดใช้งานอุปกรณ์นี้' : 'ปิดใช้งานอุปกรณ์นี้') + '" class="icon-btn ' + (st === 'disabled' ? 'bg-moph-50 text-moph-600 hover:bg-moph-100' : 'hover:bg-slate-200 hover:text-slate-600') + '"><i class="fa-solid fa-power-off text-[11px]"></i></button>' +
         '<button onclick="event.stopPropagation(); openDeviceSettingsModal(\'' + escapeHtml(id) + '\')" title="ตั้งค่าอุปกรณ์" class="icon-btn hover:bg-amber-100 hover:text-amber-600"><i class="fa-solid fa-gear text-[11px]"></i></button>' +
         '<span class="icon-btn group-hover:bg-moph-50 group-hover:text-moph-600"><i class="fa-solid fa-chart-line text-[11px]"></i></span>' +
       '</div>' +
@@ -1127,6 +1151,9 @@ function refreshStaleness() {
   const downBadge = $('sidebar-offline-badge');
   downBadge.textContent = down;
   downBadge.classList.toggle('hidden', down === 0);
+  const offBadge = $('sidebar-disabled-badge');
+  offBadge.textContent = disabled;
+  offBadge.classList.toggle('hidden', disabled === 0);
 
   syncAlertSound();
   if (activeId) updateDetail();
@@ -1411,7 +1438,6 @@ function openDeviceSettingsModal(id) {
   $('dev-cfg-id').textContent = id;
   $('dev-cfg-alias').value = c.alias || '';
   $('dev-cfg-zone').value = c.zone || '';
-  $('dev-cfg-enabled').checked = devEnabled(id);
   $('dev-cfg-min').value = (c.min === undefined || c.min === '') ? '' : c.min;
   $('dev-cfg-max').value = (c.max === undefined || c.max === '') ? '' : c.max;
   $('dev-cfg-default').textContent = defaultMin() + '-' + defaultMax() + '°C';
@@ -1421,18 +1447,72 @@ function openDeviceSettingsModal(id) {
 
 function closeDeviceSettingsModal() { closeModal('device-settings-modal'); }
 
-// One-click switch from the card. Disabling drops the device out of the
-// counts and alerts; the sensor itself keeps publishing and logging to Sheets.
-function toggleDevice(id) {
+// --- Tools > device on/off -------------------------------------------------
+// Disabling drops a device out of the counts, averages, alerts, and the
+// monthly report. The sensor itself keeps publishing and logging to Sheets.
+function setDeviceEnabled(id, enabled) {
   if (!devices[id]) return;
   const entry = devCfg[id] || (devCfg[id] = {});
-  if (entry.off) delete entry.off; else entry.off = true;
+  if (enabled) delete entry.off; else entry.off = true;
   if (!Object.keys(entry).length) delete devCfg[id];
   saveDevCfg();
   renderCard(id);
   refreshStaleness();
-  showToast((devEnabled(id) ? 'เปิดใช้งาน ' : 'ปิดใช้งาน ') + devAlias(id) + ' แล้ว', devEnabled(id) ? 'success' : 'warn');
+  renderDevicesList();
 }
+
+function toggleDevice(id) {
+  const next = !devEnabled(id);
+  setDeviceEnabled(id, next);
+  showToast((next ? 'เปิดใช้งาน ' : 'ปิดใช้งาน ') + devAlias(id) + ' แล้ว', next ? 'success' : 'warn');
+}
+
+function setAllDevices(enabled) {
+  const ids = Object.keys(devices);
+  if (!ids.length) return;
+  ids.forEach(id => setDeviceEnabled(id, enabled));
+  showToast(enabled ? 'เปิดใช้งานทุกอุปกรณ์แล้ว' : 'ปิดใช้งานทุกอุปกรณ์แล้ว', enabled ? 'success' : 'warn');
+}
+
+function renderDevicesList() {
+  const box = $('devices-list');
+  if (!box || $('devices-modal').classList.contains('hidden')) return;
+  const ids = Object.keys(devices).sort();
+  if (!ids.length) {
+    box.innerHTML = '<p class="py-10 text-center text-sm text-slate-400">ยังไม่ได้รับข้อมูลจากอุปกรณ์</p>';
+    return;
+  }
+  box.innerHTML = ids.map(id => {
+    const st = statusOf(id);
+    const on = devEnabled(id);
+    const m = STATUS_META[st];
+    return '<div class="flex items-center gap-3 py-3">' +
+      '<span class="w-2.5 h-2.5 rounded-full shrink-0 ' + m.bar + '"></span>' +
+      '<div class="min-w-0 flex-1">' +
+        '<div class="text-sm font-bold text-slate-800 dark:text-slate-100 truncate">' + escapeHtml(devAlias(id)) + '</div>' +
+        '<div class="text-[10px] text-slate-500 dark:text-slate-400 truncate">' + escapeHtml(devZone(id)) +
+          ' <span class="font-mono opacity-60">(' + escapeHtml(id) + ')</span> &bull; ' + m.label + '</div>' +
+      '</div>' +
+      '<span class="text-[10px] font-bold ' + (on ? 'text-moph-600 dark:text-moph-400' : 'text-slate-400') + '">' + (on ? 'เฝ้าระวัง' : 'ปิดอยู่') + '</span>' +
+      '<button type="button" role="switch" aria-checked="' + on + '" data-dev="' + escapeHtml(id) + '" ' +
+        'class="relative w-11 h-6 rounded-full transition-colors shrink-0 ' + (on ? 'bg-moph-500' : 'bg-slate-300 dark:bg-slate-600') + '">' +
+        '<span class="absolute top-0.5 left-0.5 w-5 h-5 rounded-full bg-white shadow transition-transform ' + (on ? 'translate-x-5' : '') + '"></span>' +
+      '</button>' +
+    '</div>';
+  }).join('');
+}
+
+function openDevicesModal() {
+  openModal('devices-modal');
+  renderDevicesList();
+}
+
+function closeDevicesModal() { closeModal('devices-modal'); }
+
+$('devices-list').addEventListener('click', e => {
+  const btn = e.target.closest('[data-dev]');
+  if (btn) toggleDevice(btn.dataset.dev);
+});
 
 function saveDeviceSettings() {
   const id = $('dev-cfg-key').value;
@@ -1442,7 +1522,7 @@ function saveDeviceSettings() {
   const zone = $('dev-cfg-zone').value.trim();
   const min = $('dev-cfg-min').value.trim();
   const max = $('dev-cfg-max').value.trim();
-  if (!$('dev-cfg-enabled').checked) entry.off = true;
+  if (devCfg[id] && devCfg[id].off) entry.off = true;   // on/off lives in the Tools dialog
   if (alias) entry.alias = alias;
   if (zone) entry.zone = zone;
   if (min !== '' && !isNaN(+min)) entry.min = +min;
