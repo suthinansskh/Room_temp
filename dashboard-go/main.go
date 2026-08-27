@@ -6,10 +6,12 @@ import (
 	"embed"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
 	"net/url"
+	"strconv"
 	"time"
 )
 
@@ -122,6 +124,28 @@ func (h *Hub) handleHistory(cfg Config) http.HandlerFunc {
 			http.Error(w, "device required", http.StatusBadRequest)
 			return
 		}
+
+		// range=daily|monthly returns the Apps Script aggregate rows verbatim
+		// (period, avg_temp, min_temp, max_temp, avg_hum, ...) for the charts
+		// and the monthly report. The in-memory buffer cannot answer those.
+		switch r.URL.Query().Get("range") {
+		case "daily", "monthly":
+			if cfg.GoogleSheetsURL == "" {
+				writeJSON(w, []any{})
+				return
+			}
+			rows, err := fetchSheetAggregate(httpc, cfg.GoogleSheetsURL, id,
+				r.URL.Query().Get("range"), r.URL.Query().Get("n"))
+			if err != nil {
+				log.Printf("aggregate history for %s: %v", id, err)
+				http.Error(w, "upstream error", http.StatusBadGateway)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.Write(rows)
+			return
+		}
+
 		if cfg.GoogleSheetsURL != "" {
 			if pts, err := fetchSheetHistory(httpc, cfg.GoogleSheetsURL, id); err == nil && len(pts) > 0 {
 				writeJSON(w, pts)
@@ -130,6 +154,44 @@ func (h *Hub) handleHistory(cfg Config) http.HandlerFunc {
 		}
 		writeJSON(w, h.historyFor(id))
 	}
+}
+
+// fetchSheetAggregate proxies the Apps Script daily/monthly report rows. The
+// payload is passed through untouched: the dashboard understands the sheet's
+// own column names.
+func fetchSheetAggregate(c *http.Client, base, device, rangeName, n string) ([]byte, error) {
+	u, err := url.Parse(base)
+	if err != nil {
+		return nil, err
+	}
+	if n == "" {
+		n = "400"
+	}
+	if _, err := strconv.Atoi(n); err != nil {
+		n = "400"
+	}
+	q := u.Query()
+	q.Set("action", rangeName+"_history")
+	q.Set("device", device)
+	q.Set("n", n)
+	u.RawQuery = q.Encode()
+
+	resp, err := c.Get(u.String())
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("apps script returned %s", resp.Status)
+	}
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if err != nil {
+		return nil, err
+	}
+	if !json.Valid(body) {
+		return nil, fmt.Errorf("apps script returned non-JSON (%d bytes)", len(body))
+	}
+	return body, nil
 }
 
 // sheetRow matches the columns the Apps Script logger returns for ?action=history.

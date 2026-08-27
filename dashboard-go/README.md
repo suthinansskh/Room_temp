@@ -10,8 +10,12 @@ browser connecting to HiveMQ directly (with subscribe-only creds living in
 - computes status (online/stale/offline) and the fleet summary;
 - streams a fresh snapshot to every browser over **Server-Sent Events** (`/events`).
 
-The frontend is the same UI as the static version — same CSS/layout and Chart.js —
-with the MQTT-in-browser logic replaced by an `EventSource('/events')` feed.
+The frontend is the same UI as the static version — same Tailwind/Sarabun shell,
+status tiles, zone filters, per-device thresholds, chart dialog, and printable
+monthly report — with the MQTT-in-browser logic replaced by an
+`EventSource('/events')` feed. There is no broker settings dialog here: the
+server owns the credentials, so the settings dialog only shows server state and
+the display thresholds.
 
 ```
 browser ──HTTP/SSE──► Go server ──MQTT/TLS──► HiveMQ Cloud
@@ -61,11 +65,16 @@ go build -o dashboard.exe .
 | `GET /events` | SSE stream of snapshots (`{mqtt, base, now, summary, devices[]}`) |
 | `GET /api/devices` | one snapshot as JSON |
 | `GET /api/history?device=<id>` | chart history (`[{t,T,H}]`); Sheets-backed if `GS_URL` set, else in-memory |
+| `GET /api/history?device=<id>&range=daily\|monthly[&n=]` | Apps Script daily/monthly aggregate rows (`[{period,avg_temp,min_temp,max_temp,avg_hum,…}]`) passed through verbatim; empty array when `GS_URL` is unset — powers the Daily/Monthly chart toggle and the monthly report |
 
 ## Notes
 
-- The server owns status classification using `STALE_SECONDS`; the browser only
-  renders. Search / sort / status-filter remain client-side display controls.
+- The server owns online/stale/offline classification using `STALE_SECONDS`; the
+  browser adds the temperature verdict (ปกติ / เฝ้าระวัง / อันตราย) from thresholds it
+  holds locally. Search, sort, status/zone filters, device aliases, zones, and
+  min/max limits are per-browser display state kept in `localStorage`.
+- The page loads Tailwind, Sarabun, and Font Awesome from public CDNs; a display
+  with no internet access needs those three assets vendored into `web/`.
 - HiveMQ Cloud presents a valid (Let's Encrypt) certificate, so leave
   `MQTT_INSECURE=false` in production. Only enable it for brokers with self-signed certs.
 - The original static [dashboard/index.html](../dashboard/index.html) is left in place; this

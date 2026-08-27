@@ -219,21 +219,27 @@ The first deployment URL is the one you put into the device's **GScript path** f
 
 1. Push this repo to GitHub.
 2. Repo **Settings → Pages → Build from branch** → choose `main` and `/dashboard` (or move `dashboard/index.html` to repo root).
-3. Open the published URL, expand **⚙️ Configuration**, and enter:
+3. Open the published URL. On a fresh browser a start screen offers **ตั้งค่า & เชื่อมต่อ MQTT** (opens the settings dialog) or **โหมดทดสอบ (Demo)** — a built-in simulated feed for walking through the UI without a broker. In the settings dialog enter:
    - HiveMQ host, port `8884`, the **subscribe-only** user/pass
    - **Base topic** = `room` (matches the device base)
-   - **Expected device IDs** = `room1,room2,…,room10` (pre-renders the grid even before any device publishes)
-   - (optional) Google Sheets `/exec` URL — pre-loads the chart with history when you click a device
+   - **Stale after** — seconds without a reading before a device is dimmed
+   - **Visible device IDs** = `room1,room2,…,room10` (pre-renders the grid even before any device publishes; blank shows everything discovered)
+   - (optional) Google Sheets `/exec` URL — backfills the chart and feeds the Daily / Monthly views and the monthly report
+   - **Default thresholds** — the °C band that counts as normal, with one-click presets for a vaccine fridge (2–8 °C) and an ordinary room (20–30 °C)
 
-The dashboard:
+The dashboard (Thai/English, MOPH-green theme, auto light/dark):
 
 - Subscribes to `room/+` (data) and `room/+/status` (LWT online/offline).
-- Renders one card per device in a responsive grid showing **temperature + humidity**.
-- Marks a device **stale** (dimmed) after the configured timeout, **offline** when its LWT fires.
-- Click a card to open a temp/humidity chart for that device with a **Live / Daily / Monthly** toggle — Live streams MQTT (backfilled from Sheets), Daily and Monthly chart the avg temp/humidity aggregates straight from Google Sheets.
-- Shows a fleet summary: online count, average temp, average humidity, min/max temp.
+- Renders one card per device in a responsive grid showing **temperature + humidity**, its threshold band, RSSI, last-seen age, and a link to the device's own web page.
+- Classifies each device as **ปกติ / เฝ้าระวัง / อันตราย / ขาดการติดต่อ** — a critical card pulses red, the sidebar carries an alert badge, a toast fires on every status change, and 🔊 in the top bar turns on an audible alarm.
+- Summary tiles count devices per status and show average temp, average humidity, and the live min/max range. Chips filter by status and by **zone**; the search box matches id, alias, or zone; the sort menu orders by name, temperature, status, or recency.
+- ⚙️ on a card sets a per-device **alias, zone, and min/max thresholds** (kept in `localStorage`, so each viewer can label their own rooms).
+- Click a card for the detail dialog: temp/humidity charts with a **Live / Daily / Monthly** toggle — Live streams MQTT (backfilled from Sheets), Daily and Monthly chart the avg temp/humidity aggregates straight from Google Sheets — plus a data table and IP / RSSI / uptime / last-update.
+- **รายงานรายเดือน** builds a printable A4 report for a month and zone (daily-average chart, per-device summary table with out-of-range day counts, signature block) or downloads the same data as CSV; **ส่งออกข้อมูล** exports the buffered live readings.
 
 Credentials live only in the visitor's `localStorage`. For a public dashboard, always use the **subscribe-only** HiveMQ user.
+
+Styling comes from the Tailwind Play CDN plus Google Fonts (Sarabun) and Font Awesome, so the page needs internet access for more than data — for an air-gapped display use the Go dashboard below with vendored assets, or compile Tailwind ahead of time.
 
 ## 6. Rolling out 10 devices
 
