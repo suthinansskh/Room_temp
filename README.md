@@ -34,7 +34,9 @@ Payload (retained on each device topic):
 { "device":"room3", "temp":24.7, "hum":58, "rssi":-61, "uptime":1234 }
 ```
 
-Status messages are `online` / `offline` (LWT-based) and are also retained.
+Status messages are `online` / `offline` (LWT-based) and are also retained. Nothing else is ever published there, so a subscriber can read `<base>/<device>/status` as a plain online flag.
+
+Command acks and sensor events go to a separate, **non-retained** topic `<base>/<device>/ack` (`sensor_fault`, `sensor_ok`, `offset t=… h=…`) — an event that outlives the condition it reports has no business sitting retained on the status topic. Commands are received on `<base>/<device>/cmd` (`read`, `reboot`, `offset <T> <H>`).
 
 ## Repository layout
 
@@ -135,12 +137,23 @@ Set the networks any of three ways:
 - **`/config` page** — edit all three SSID/password slots on a running device (clear an SSID to disable that slot).
 - **Compile-time defaults** — `DEFAULT_WIFI{1,2,3}_SSID/PASS` in `secrets.h`, so a whole fleet ships pre-loaded with the known office APs (see [secrets.h.example](firmware/Room_temp/secrets.h.example)).
 
+### Firmware 1.6.0 — reliability fixes
+
+Flash this over any 1.4.x/1.5.x board; EEPROM config migrates in place.
+
+- **MQTT keepalive raised to 90 s.** `postToSheet()` blocks for several seconds per TLS hop and cannot pump `mqtt.loop()` meanwhile; PubSubClient's 15 s default let the broker drop the client mid-POST and fire the LWT, so a device flapped offline around every 30 min.
+- **`/status` is LWT-only.** `sensor_fault` and command acks moved to the non-retained `<base>/<device>/ack`. A retained `sensor_fault` used to sit on the status topic forever, leaving the device permanently "offline" in the dashboard even while data flowed; recovery now re-asserts `online`.
+- **Sensor watchdog arms at boot.** It used to skip entirely when the DHT never produced a first reading, so a sensor dead at power-on meant a device that was online but silent, with no re-init and no reboot.
+- **Captive portal times out after 3 min** and reboots to retry the saved networks, instead of parking in AP mode until someone visits it.
+- **TLS footprint**: probes RFC 6066 max-fragment-length and, when the broker supports it, runs the MQTT session on a 1 KB buffer instead of BearSSL's default 16 KB — leaving room for the second TLS session the Sheets POST opens.
+- Config strings are always NUL-terminated on load; `/api` reports `null` instead of `0` for a missing reading; the device page's Wi-Fi reset is a real POST with a confirmation instead of a dead GET link.
+
 Settings persist in EEPROM. To re-run the portal: `POST` to `http://<device-ip>/reset` (admin auth required) or hold FLASH at boot (5 s long-press also wipes Wi-Fi at runtime).
 
 Local endpoints once connected:
 
 - `http://<ip>/` — small status page (auto-refreshing)
-- `http://<ip>/api` — JSON `{device, temp, hum, rssi, ip, uptime, mqtt, fw}`
+- `http://<ip>/api` — JSON `{device, temp, hum, rssi, ip, uptime, mqtt, fault, fw}` (`temp`/`hum` are `null`, not `0`, when the DHT has no valid reading)
 - `http://<ip>/config` — settings form (admin auth; GET to view, POST to save)
 - `http://<ip>/metrics` — JSON diagnostics: boots, reconnects, sensor faults, heap (admin auth)
 - `POST http://<ip>/reset` — wipe Wi-Fi creds and reboot (admin auth)
@@ -234,6 +247,7 @@ The dashboard (Thai/English, MOPH-green theme, auto light/dark):
 - Classifies each device as **ปกติ / เฝ้าระวัง / อันตราย / ขาดการติดต่อ** — a critical card pulses red, the sidebar carries an alert badge, a toast fires on every status change, and 🔊 in the top bar turns on an audible alarm.
 - Summary tiles count devices per status and show average temp, average humidity, and the live min/max range. Chips filter by status and by **zone**; the search box matches id, alias, or zone; the sort menu orders by name, temperature, status, or recency.
 - ⚙️ on a card sets a per-device **alias, zone, and min/max thresholds** (kept in `localStorage`, so each viewer can label their own rooms).
+- ⏻ on a card (or the switch in the device dialog) **turns monitoring off for that device** — use it for a sensor that is removed or under maintenance. A disabled device is dimmed and sorted last, drops out of the status counts, the averages, the alerts/sound, and the monthly report, and gets its own filter chip; the sensor itself keeps publishing and logging to Sheets. The total tile shows `+n ปิดใช้งาน` so the count still adds up.
 - Click a card for the detail dialog: temp/humidity charts with a **Live / Daily / Monthly** toggle — Live streams MQTT (backfilled from Sheets), Daily and Monthly chart the avg temp/humidity aggregates straight from Google Sheets — plus a data table and IP / RSSI / uptime / last-update.
 - **รายงานรายเดือน** builds a printable A4 report for a month and zone (daily-average chart, per-device summary table with out-of-range day counts, signature block) or downloads the same data as CSV; **ส่งออกข้อมูล** exports the buffered live readings.
 

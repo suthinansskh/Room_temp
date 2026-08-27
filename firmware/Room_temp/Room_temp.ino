@@ -42,7 +42,7 @@
 #include <EEPROM.h>
 #include "secrets.h"
 
-#define FW_VERSION "1.5.0"
+#define FW_VERSION "1.6.0"
 
 // Optional compiled-in Wi-Fi defaults. Define any of these in secrets.h to
 // pre-load known networks on every unit; leave undefined for portal-only setup.
@@ -164,6 +164,15 @@ void statsSave() {
   ESP.rtcUserMemoryWrite(0, (uint32_t*)&stats, sizeof(stats));
 }
 
+// strncpy leaves the destination unterminated when the source fills the
+// buffer, and EEPROM content can be garbage even when the magic matches.
+// Every config copy goes through this instead.
+void copyStr(char* dst, const char* src, size_t size) {
+  if (!size) return;
+  strncpy(dst, src, size - 1);
+  dst[size - 1] = '\0';
+}
+
 void saveConfig();   // forward decl: loadConfig calls saveConfig on v1→v2 migration
 
 void loadConfig() {
@@ -185,18 +194,18 @@ void loadConfig() {
     migrated = true;
   }
   if (cfg.magic == CFG_MAGIC_V1 || cfg.magic == CFG_MAGIC_V2 || cfg.magic == CFG_MAGIC_V3) {
-    strncpy(mqtt_server, cfg.mqtt_server, sizeof(mqtt_server));
-    strncpy(mqtt_port_s, cfg.mqtt_port_s, sizeof(mqtt_port_s));
-    strncpy(mqtt_user,   cfg.mqtt_user,   sizeof(mqtt_user));
-    strncpy(mqtt_pass,   cfg.mqtt_pass,   sizeof(mqtt_pass));
-    strncpy(mqtt_base,   cfg.mqtt_base,   sizeof(mqtt_base));
-    strncpy(gs_host,     cfg.gs_host,     sizeof(gs_host));
-    strncpy(gs_path,     cfg.gs_path,     sizeof(gs_path));
-    strncpy(project_id,  cfg.project_id,  sizeof(project_id));
-    strncpy(device_id,   cfg.device_id,   sizeof(device_id));
+    copyStr(mqtt_server, cfg.mqtt_server, sizeof(mqtt_server));
+    copyStr(mqtt_port_s, cfg.mqtt_port_s, sizeof(mqtt_port_s));
+    copyStr(mqtt_user,   cfg.mqtt_user,   sizeof(mqtt_user));
+    copyStr(mqtt_pass,   cfg.mqtt_pass,   sizeof(mqtt_pass));
+    copyStr(mqtt_base,   cfg.mqtt_base,   sizeof(mqtt_base));
+    copyStr(gs_host,     cfg.gs_host,     sizeof(gs_host));
+    copyStr(gs_path,     cfg.gs_path,     sizeof(gs_path));
+    copyStr(project_id,  cfg.project_id,  sizeof(project_id));
+    copyStr(device_id,   cfg.device_id,   sizeof(device_id));
     temp_offset = cfg.temp_offset;
     hum_offset  = cfg.hum_offset;
-    strncpy(admin_pass,  cfg.admin_pass,  sizeof(admin_pass));
+    copyStr(admin_pass,  cfg.admin_pass,  sizeof(admin_pass));
     memcpy(wifi_ssid, cfg.wifi_ssid, sizeof(wifi_ssid));
     memcpy(wifi_pass, cfg.wifi_pass, sizeof(wifi_pass));
   }
@@ -205,18 +214,18 @@ void loadConfig() {
 
 void saveConfig() {
   cfg.magic = CFG_MAGIC_V3;
-  strncpy(cfg.mqtt_server, mqtt_server, sizeof(cfg.mqtt_server));
-  strncpy(cfg.mqtt_port_s, mqtt_port_s, sizeof(cfg.mqtt_port_s));
-  strncpy(cfg.mqtt_user,   mqtt_user,   sizeof(cfg.mqtt_user));
-  strncpy(cfg.mqtt_pass,   mqtt_pass,   sizeof(cfg.mqtt_pass));
-  strncpy(cfg.mqtt_base,   mqtt_base,   sizeof(cfg.mqtt_base));
-  strncpy(cfg.gs_host,     gs_host,     sizeof(cfg.gs_host));
-  strncpy(cfg.gs_path,     gs_path,     sizeof(cfg.gs_path));
-  strncpy(cfg.project_id,  project_id,  sizeof(cfg.project_id));
-  strncpy(cfg.device_id,   device_id,   sizeof(cfg.device_id));
+  copyStr(cfg.mqtt_server, mqtt_server, sizeof(cfg.mqtt_server));
+  copyStr(cfg.mqtt_port_s, mqtt_port_s, sizeof(cfg.mqtt_port_s));
+  copyStr(cfg.mqtt_user,   mqtt_user,   sizeof(cfg.mqtt_user));
+  copyStr(cfg.mqtt_pass,   mqtt_pass,   sizeof(cfg.mqtt_pass));
+  copyStr(cfg.mqtt_base,   mqtt_base,   sizeof(cfg.mqtt_base));
+  copyStr(cfg.gs_host,     gs_host,     sizeof(cfg.gs_host));
+  copyStr(cfg.gs_path,     gs_path,     sizeof(cfg.gs_path));
+  copyStr(cfg.project_id,  project_id,  sizeof(cfg.project_id));
+  copyStr(cfg.device_id,   device_id,   sizeof(cfg.device_id));
   cfg.temp_offset = temp_offset;
   cfg.hum_offset  = hum_offset;
-  strncpy(cfg.admin_pass,  admin_pass,  sizeof(cfg.admin_pass));
+  copyStr(cfg.admin_pass,  admin_pass,  sizeof(cfg.admin_pass));
   memcpy(cfg.wifi_ssid, wifi_ssid, sizeof(cfg.wifi_ssid));
   memcpy(cfg.wifi_pass, wifi_pass, sizeof(cfg.wifi_pass));
   EEPROM.begin(sizeof(Config));
@@ -300,6 +309,26 @@ void oledData() {
   display.display();
 }
 
+bool sensorFaultActive = false;   // a sensor_fault ack is outstanding
+
+// <base>/<device>/status is the LWT channel: only "online"/"offline" ever go
+// here, retained, so a subscriber can treat any other payload as a bug.
+void publishStatus(const char* state) {
+  if (!mqtt.connected()) return;
+  char topic[80];
+  snprintf(topic, sizeof(topic), "%s/%s/status", mqtt_base, device_id);
+  mqtt.publish(topic, state, true);
+}
+
+// <base>/<device>/ack carries command acks and sensor events. Not retained:
+// these are events, and a retained one would outlive the condition it reports.
+void publishAck(const char* msg) {
+  if (!mqtt.connected()) return;
+  char topic[80];
+  snprintf(topic, sizeof(topic), "%s/%s/ack", mqtt_base, device_id);
+  mqtt.publish(topic, msg, false);
+}
+
 // ---------------- Sensor reading ----------------
 // Small insertion sort on the live samples; returns the middle one.
 float median5(const float* arr, uint8_t n) {
@@ -331,13 +360,21 @@ bool readSensorSample() {
   lastHum  = median5(hHist, histCount);
   lastValidReadMs = millis();
   sensorReinited = false;
+  if (sensorFaultActive) {
+    // The retained status may still say the device was faulty (older firmware
+    // published sensor_fault there); re-assert online now that data is flowing.
+    sensorFaultActive = false;
+    publishAck("sensor_ok");
+    publishStatus("online");
+  }
   return true;
 }
 
 // If no valid reading for FAULT_REINIT_MS, re-init the bus and publish a
 // status flag. If still nothing by FAULT_REBOOT_MS, restart.
 void sensorWatchdog() {
-  if (lastValidReadMs == 0) return;
+  // lastValidReadMs is seeded at boot, so a sensor that never produced a
+  // single reading still trips the re-init and the reboot below.
   unsigned long age = millis() - lastValidReadMs;
   if (age >= FAULT_REBOOT_MS) {
     Serial.println("Sensor dead > 30 min, restarting");
@@ -349,11 +386,8 @@ void sensorWatchdog() {
     Serial.println("Sensor NaN > 5 min, re-init dht");
     stats.sensorFaults++;
     statsSave();
-    if (mqtt.connected()) {
-      char t[80];
-      snprintf(t, sizeof(t), "%s/%s/status", mqtt_base, device_id);
-      mqtt.publish(t, "sensor_fault", true);
-    }
+    sensorFaultActive = true;
+    publishAck("sensor_fault");
     dht.begin();
     sensorReinited = true;
   }
@@ -409,43 +443,41 @@ void startPortal() {
 
   oledMsg("WiFi Setup", "AP: RoomTemp-Setup", "192.168.4.1");
 
+  // Never park in the portal forever: if nobody configures the device within
+  // 3 minutes, reboot and retry the saved networks (the AP may just be down).
+  wm.setConfigPortalTimeout(180);
+
   // Always config mode: ensureWifi() only calls us when we actually need the
   // portal (multi-connect failed or the FLASH button forced it).
   bool ok = wm.startConfigPortal("RoomTemp-Setup");
   if (!ok) {
-    oledMsg("WiFi failed", "Restarting...");
+    oledMsg("WiFi timeout", "Retrying...");
     delay(1500); ESP.restart();
   }
 
   if (shouldSaveConfig) {
-    strncpy(mqtt_server, p_mqtt_server.getValue(), sizeof(mqtt_server));
-    strncpy(mqtt_port_s, p_mqtt_port.getValue(),   sizeof(mqtt_port_s));
-    strncpy(mqtt_user,   p_mqtt_user.getValue(),   sizeof(mqtt_user));
-    strncpy(mqtt_pass,   p_mqtt_pass.getValue(),   sizeof(mqtt_pass));
-    strncpy(mqtt_base,   p_mqtt_base.getValue(),   sizeof(mqtt_base));
-    strncpy(gs_host,     p_gs_host.getValue(),     sizeof(gs_host));
-    strncpy(gs_path,     p_gs_path.getValue(),     sizeof(gs_path));
-    strncpy(project_id,  p_proj.getValue(),        sizeof(project_id));
-    strncpy(device_id,   p_dev.getValue(),         sizeof(device_id));
-    strncpy(wifi_ssid[1], p_w2_ssid.getValue(), sizeof(wifi_ssid[1]));
-    strncpy(wifi_pass[1], p_w2_pass.getValue(), sizeof(wifi_pass[1]));
-    strncpy(wifi_ssid[2], p_w3_ssid.getValue(), sizeof(wifi_ssid[2]));
-    strncpy(wifi_pass[2], p_w3_pass.getValue(), sizeof(wifi_pass[2]));
-    wifi_ssid[1][sizeof(wifi_ssid[1]) - 1] = '\0';
-    wifi_pass[1][sizeof(wifi_pass[1]) - 1] = '\0';
-    wifi_ssid[2][sizeof(wifi_ssid[2]) - 1] = '\0';
-    wifi_pass[2][sizeof(wifi_pass[2]) - 1] = '\0';
+    copyStr(mqtt_server, p_mqtt_server.getValue(), sizeof(mqtt_server));
+    copyStr(mqtt_port_s, p_mqtt_port.getValue(),   sizeof(mqtt_port_s));
+    copyStr(mqtt_user,   p_mqtt_user.getValue(),   sizeof(mqtt_user));
+    copyStr(mqtt_pass,   p_mqtt_pass.getValue(),   sizeof(mqtt_pass));
+    copyStr(mqtt_base,   p_mqtt_base.getValue(),   sizeof(mqtt_base));
+    copyStr(gs_host,     p_gs_host.getValue(),     sizeof(gs_host));
+    copyStr(gs_path,     p_gs_path.getValue(),     sizeof(gs_path));
+    copyStr(project_id,  p_proj.getValue(),        sizeof(project_id));
+    copyStr(device_id,   p_dev.getValue(),         sizeof(device_id));
+    copyStr(wifi_ssid[1], p_w2_ssid.getValue(), sizeof(wifi_ssid[1]));
+    copyStr(wifi_pass[1], p_w2_pass.getValue(), sizeof(wifi_pass[1]));
+    copyStr(wifi_ssid[2], p_w3_ssid.getValue(), sizeof(wifi_ssid[2]));
+    copyStr(wifi_pass[2], p_w3_pass.getValue(), sizeof(wifi_pass[2]));
   }
 
   // The portal just associated with the primary AP; capture those creds into
   // slot 0 so WiFiMulti can auto-connect to it (or fail over) next boot.
   String primarySsid = WiFi.SSID();
   if (primarySsid.length()) {
-    strncpy(wifi_ssid[0], primarySsid.c_str(), sizeof(wifi_ssid[0]));
-    wifi_ssid[0][sizeof(wifi_ssid[0]) - 1] = '\0';
+    copyStr(wifi_ssid[0], primarySsid.c_str(), sizeof(wifi_ssid[0]));
     String primaryPsk = WiFi.psk();
-    strncpy(wifi_pass[0], primaryPsk.c_str(), sizeof(wifi_pass[0]));
-    wifi_pass[0][sizeof(wifi_pass[0]) - 1] = '\0';
+    copyStr(wifi_pass[0], primaryPsk.c_str(), sizeof(wifi_pass[0]));
   }
   saveConfig();
 }
@@ -494,9 +526,7 @@ void mqttCallback(char* topic, byte* payload, unsigned int len) {
       saveConfig();
       char ack[64];
       snprintf(ack, sizeof(ack), "offset t=%.2f h=%.2f", t, h);
-      char st[80];
-      snprintf(st, sizeof(st), "%s/%s/status", mqtt_base, device_id);
-      mqtt.publish(st, ack, true);
+      publishAck(ack);
     }
   }
 }
@@ -516,7 +546,7 @@ void mqttConnect() {
   Serial.printf("MQTT connect to %s:%s as %s ...\n", mqtt_server, mqtt_port_s, cid);
   if (mqtt.connect(cid, mqtt_user, mqtt_pass, willTopic, 0, true, "offline")) {
     Serial.println("MQTT connected");
-    mqtt.publish(willTopic, "online", true);
+    publishStatus("online");
     char cmdTopic[80];
     snprintf(cmdTopic, sizeof(cmdTopic), "%s/%s/cmd", mqtt_base, device_id);
     mqtt.subscribe(cmdTopic);
@@ -656,12 +686,13 @@ void handleRoot()  { server.send_P(200, "text/html", INDEX_HTML); }
 void handleApi() {
   StaticJsonDocument<224> doc;
   doc["device"] = device_id;
-  doc["temp"]   = isnan(lastTemp) ? 0 : lastTemp;
-  doc["hum"]    = isnan(lastHum)  ? 0 : lastHum;
+  if (isnan(lastTemp)) doc["temp"] = nullptr; else doc["temp"] = lastTemp;
+  if (isnan(lastHum))  doc["hum"]  = nullptr; else doc["hum"]  = lastHum;
   doc["rssi"]   = WiFi.RSSI();
   doc["ip"]     = WiFi.localIP().toString();
   doc["uptime"] = (uint32_t)(millis() / 1000);
   doc["mqtt"]   = mqtt.connected();
+  doc["fault"]  = sensorFaultActive;
   doc["fw"]     = FW_VERSION;
   String s; serializeJson(doc, s);
   server.send(200, "application/json", s);
@@ -827,8 +858,22 @@ void setup() {
   Serial.print("IP: "); Serial.println(WiFi.localIP());
 
   secureClient.setInsecure();
+  // BearSSL takes a 16 KB receive buffer by default, which has to coexist with
+  // the second TLS session postToSheet() opens. If the broker supports RFC 6066
+  // max-fragment-length we can run the MQTT session on ~1 KB instead.
+  if (secureClient.probeMaxFragmentLength(mqtt_server, atoi(mqtt_port_s), 1024)) {
+    secureClient.setBufferSizes(1024, 512);
+    Serial.println("MQTT TLS: MFLN 1024 negotiated");
+  }
   mqtt.setBufferSize(512);
+  // postToSheet() blocks for several seconds per TLS hop and cannot pump
+  // mqtt.loop() while it does. PubSubClient defaults to a 15 s keepalive, so
+  // the broker would drop us mid-POST and fire the LWT; 90 s leaves headroom.
+  mqtt.setKeepAlive(90);
   mqtt.setCallback(mqttCallback);
+
+  // Seed the sensor watchdog so a DHT that is dead from power-on still trips it.
+  lastValidReadMs = millis();
 
   server.on("/",            handleRoot);
   server.on("/api",         handleApi);

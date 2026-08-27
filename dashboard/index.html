@@ -241,7 +241,8 @@
       <div class="grid grid-cols-2 lg:grid-cols-5 gap-4 mb-4">
         <div class="card p-4 flex justify-between items-center relative overflow-hidden">
           <div class="absolute top-0 left-0 w-1 h-full bg-slate-400"></div>
-          <div class="pl-2"><div class="stat-label">อุปกรณ์ทั้งหมด</div><div id="stat-total" class="stat-value text-slate-700 dark:text-slate-200">0</div></div>
+          <div class="pl-2"><div class="stat-label">อุปกรณ์ทั้งหมด</div><div id="stat-total" class="stat-value text-slate-700 dark:text-slate-200">0</div>
+            <div id="stat-disabled-note" class="text-[10px] text-slate-400 mt-1 hidden"></div></div>
           <div class="w-10 h-10 rounded-full bg-slate-50 dark:bg-slate-800 flex items-center justify-center text-slate-400"><i class="fa-solid fa-server"></i></div>
         </div>
         <div class="card p-4 flex justify-between items-center relative overflow-hidden">
@@ -465,6 +466,11 @@
         <input id="dev-cfg-zone" class="field" placeholder="เช่น อาคาร A" list="zone-list" />
         <datalist id="zone-list"></datalist>
       </div>
+      <label class="flex items-center gap-3 card p-3 cursor-pointer">
+        <input type="checkbox" id="dev-cfg-enabled" class="w-4 h-4 accent-moph-600 shrink-0" checked />
+        <span class="text-sm font-bold text-slate-700 dark:text-slate-200">เปิดใช้งานการเฝ้าระวัง</span>
+        <span class="ml-auto text-[10px] text-slate-400 text-right leading-tight">ปิดไว้ตอนถอดเซ็นเซอร์/ซ่อมบำรุง<br>จะไม่นับในสถิติและไม่แจ้งเตือน</span>
+      </label>
       <div class="grid grid-cols-2 gap-3">
         <div><label class="lbl" for="dev-cfg-min">อุณหภูมิต่ำสุด (Min °C)</label><input id="dev-cfg-min" type="number" step="0.1" class="field tabular-nums" /></div>
         <div><label class="lbl" for="dev-cfg-max">อุณหภูมิสูงสุด (Max °C)</label><input id="dev-cfg-max" type="number" step="0.1" class="field tabular-nums" /></div>
@@ -631,6 +637,8 @@ catch (e) { console.warn('bad devCfg', e); devCfg = {}; }
 function saveDevCfg() { localStorage.setItem('devCfg', JSON.stringify(devCfg)); }
 function devAlias(id) { const c = devCfg[id]; return (c && c.alias) ? c.alias : id; }
 function devZone(id)  { const c = devCfg[id]; return (c && c.zone)  ? c.zone  : 'ทั่วไป'; }
+// Stored as `off` so every device already in localStorage stays enabled.
+function devEnabled(id) { const c = devCfg[id]; return !(c && c.off); }
 function devMin(id)   { const c = devCfg[id]; return (c && c.min !== undefined && c.min !== '') ? +c.min : defaultMin(); }
 function devMax(id)   { const c = devCfg[id]; return (c && c.max !== undefined && c.max !== '') ? +c.max : defaultMax(); }
 
@@ -788,6 +796,7 @@ function linkStatus(d) {
 function statusOf(id) {
   const d = devices[id];
   if (!d) return 'unknown';
+  if (!devEnabled(id)) return 'disabled';
   const link = linkStatus(d);
   if (link !== 'ok') return link;
   if (isNaN(d.temp)) return 'unknown';
@@ -804,6 +813,7 @@ const STATUS_META = {
   stale:   { bar:'bg-slate-300',   text:'text-slate-400',                          label:'ขาดการติดต่อ',   rank:2 },
   offline: { bar:'bg-slate-400',   text:'text-slate-400',                          label:'ออฟไลน์',        rank:2 },
   unknown: { bar:'bg-slate-300',   text:'text-slate-400',                          label:'ไม่มีข้อมูล',     rank:4 },
+  disabled:{ bar:'bg-slate-300 dark:bg-slate-700', text:'text-slate-400',            label:'ปิดใช้งาน',      rank:6 },
 };
 
 function fmtAge(ts) {
@@ -860,11 +870,12 @@ function renderCard(id) {
   const m = STATUS_META[st];
   const offline = st === 'stale' || st === 'offline' || st === 'unknown';
   const tempStr = (offline || isNaN(d.temp)) ? '--.-' : d.temp.toFixed(1);
-  const humStr = isNaN(d.hum) ? '--' : Math.round(d.hum);
+  const humStr = (offline || isNaN(d.hum)) ? '--' : Math.round(d.hum);
 
   const hidden = !created && el.classList.contains('hidden');
   el.className = 'card p-5 cursor-pointer hover:shadow-md transition-all relative overflow-hidden group ' +
-    (created ? 'card-enter ' : '') + (hidden ? 'hidden ' : '') + (st === 'crit' ? 'ring-alert' : '');
+    (created ? 'card-enter ' : '') + (hidden ? 'hidden ' : '') +
+    (st === 'disabled' ? 'opacity-60 ' : '') + (st === 'crit' ? 'ring-alert' : '');
   el.innerHTML =
     '<div class="absolute top-0 left-0 w-full h-1 ' + m.bar + '"></div>' +
     '<div class="flex justify-between items-start gap-2 mb-3">' +
@@ -898,6 +909,7 @@ function renderCard(id) {
       '</div>' +
       '<div class="flex items-center gap-1 shrink-0">' +
         (d.ip ? '<a href="http://' + escapeHtml(d.ip) + '/" target="_blank" rel="noopener" onclick="event.stopPropagation()" title="' + escapeHtml(d.ip) + '" class="icon-btn hover:bg-sky-100 hover:text-sky-600"><i class="fa-solid fa-globe text-[11px]"></i></a>' : '') +
+        '<button onclick="event.stopPropagation(); toggleDevice(\'' + escapeHtml(id) + '\')" title="' + (st === 'disabled' ? 'เปิดใช้งานอุปกรณ์นี้' : 'ปิดใช้งานอุปกรณ์นี้') + '" class="icon-btn ' + (st === 'disabled' ? 'bg-moph-50 text-moph-600 hover:bg-moph-100' : 'hover:bg-slate-200 hover:text-slate-600') + '"><i class="fa-solid fa-power-off text-[11px]"></i></button>' +
         '<button onclick="event.stopPropagation(); openDeviceSettingsModal(\'' + escapeHtml(id) + '\')" title="ตั้งค่าอุปกรณ์" class="icon-btn hover:bg-amber-100 hover:text-amber-600"><i class="fa-solid fa-gear text-[11px]"></i></button>' +
         '<span class="icon-btn group-hover:bg-moph-50 group-hover:text-moph-600"><i class="fa-solid fa-chart-line text-[11px]"></i></span>' +
       '</div>' +
@@ -913,10 +925,11 @@ function zoneList() {
 }
 
 function renderFilterBar() {
-  const counts = { all:0, ok:0, warn:0, crit:0, down:0 };
+  const counts = { all:0, ok:0, warn:0, crit:0, down:0, disabled:0 };
   Object.keys(devices).forEach(id => {
-    counts.all++;
     const st = statusOf(id);
+    if (st === 'disabled') { counts.disabled++; return; }
+    counts.all++;
     if (st === 'ok') counts.ok++;
     else if (st === 'warn') counts.warn++;
     else if (st === 'crit') counts.crit++;
@@ -930,6 +943,7 @@ function renderFilterBar() {
     ['crit', 'อันตราย',        counts.crit],
     ['down', 'ขาดการติดต่อ',   counts.down],
   ];
+  if (counts.disabled) statuses.push(['disabled', 'ปิดใช้งาน', counts.disabled]);
   // Chips carry their filter in data attributes: a zone name is user-typed
   // text, so it must never be spliced into an inline handler.
   let html = statuses.map(([key, label, n]) =>
@@ -981,6 +995,7 @@ function matchesStatus(st) {
     case 'crit':
     case 'alert': return st === 'crit';
     case 'down':  return st === 'stale' || st === 'offline' || st === 'unknown';
+    case 'disabled': return st === 'disabled';
     default:      return true;
   }
 }
@@ -1002,6 +1017,9 @@ function applyGridView() {
 
   const sorted = ids.slice().sort((a, b) => {
     const da = devices[a], db = devices[b];
+    // Disabled devices always sink to the bottom, whatever the sort is.
+    const off = (devEnabled(a) ? 0 : 1) - (devEnabled(b) ? 0 : 1);
+    if (off !== 0) return off;
     switch (view.sort) {
       case 'temp-desc': {
         const ta = isNaN(da.temp) ? -Infinity : da.temp, tb = isNaN(db.temp) ? -Infinity : db.temp;
@@ -1051,7 +1069,7 @@ $('qSort').addEventListener('change', e => { view.sort = e.target.value; applyGr
 // ===========================================================================
 function refreshStaleness() {
   const temps = [], hums = [];
-  let ok = 0, warn = 0, crit = 0, down = 0, offline = 0;
+  let ok = 0, warn = 0, crit = 0, down = 0, offline = 0, disabled = 0;
 
   Object.values(devices).forEach(d => {
     if (!shouldShowDevice(d.id)) {
@@ -1062,6 +1080,13 @@ function refreshStaleness() {
       return;
     }
     const st = statusOf(d.id);
+    if (st === 'disabled') {
+      // Not monitored: no counts, no averages, no alerts.
+      disabled++;
+      d.lastAlert = st;
+      renderCard(d.id);
+      return;
+    }
     if (st === 'ok') ok++;
     else if (st === 'warn') warn++;
     else if (st === 'crit') crit++;
@@ -1080,8 +1105,11 @@ function refreshStaleness() {
     renderCard(d.id);
   });
 
-  const total = Object.keys(devices).length;
+  const total = Object.keys(devices).length - disabled;
   $('stat-total').textContent = total;
+  const note = $('stat-disabled-note');
+  note.textContent = disabled ? '+' + disabled + ' ปิดใช้งาน' : '';
+  note.classList.toggle('hidden', disabled === 0);
   $('stat-ok').textContent = ok;
   $('stat-warn').textContent = warn;
   $('stat-crit').textContent = crit;
@@ -1383,6 +1411,7 @@ function openDeviceSettingsModal(id) {
   $('dev-cfg-id').textContent = id;
   $('dev-cfg-alias').value = c.alias || '';
   $('dev-cfg-zone').value = c.zone || '';
+  $('dev-cfg-enabled').checked = devEnabled(id);
   $('dev-cfg-min').value = (c.min === undefined || c.min === '') ? '' : c.min;
   $('dev-cfg-max').value = (c.max === undefined || c.max === '') ? '' : c.max;
   $('dev-cfg-default').textContent = defaultMin() + '-' + defaultMax() + '°C';
@@ -1392,6 +1421,19 @@ function openDeviceSettingsModal(id) {
 
 function closeDeviceSettingsModal() { closeModal('device-settings-modal'); }
 
+// One-click switch from the card. Disabling drops the device out of the
+// counts and alerts; the sensor itself keeps publishing and logging to Sheets.
+function toggleDevice(id) {
+  if (!devices[id]) return;
+  const entry = devCfg[id] || (devCfg[id] = {});
+  if (entry.off) delete entry.off; else entry.off = true;
+  if (!Object.keys(entry).length) delete devCfg[id];
+  saveDevCfg();
+  renderCard(id);
+  refreshStaleness();
+  showToast((devEnabled(id) ? 'เปิดใช้งาน ' : 'ปิดใช้งาน ') + devAlias(id) + ' แล้ว', devEnabled(id) ? 'success' : 'warn');
+}
+
 function saveDeviceSettings() {
   const id = $('dev-cfg-key').value;
   if (!id) return;
@@ -1400,6 +1442,7 @@ function saveDeviceSettings() {
   const zone = $('dev-cfg-zone').value.trim();
   const min = $('dev-cfg-min').value.trim();
   const max = $('dev-cfg-max').value.trim();
+  if (!$('dev-cfg-enabled').checked) entry.off = true;
   if (alias) entry.alias = alias;
   if (zone) entry.zone = zone;
   if (min !== '' && !isNaN(+min)) entry.min = +min;
@@ -1569,13 +1612,13 @@ function downloadCSV(filename, rows) {
 function exportCSV() {
   const ids = Object.keys(devices).sort();
   if (!ids.length) { showToast('ยังไม่มีข้อมูลให้ส่งออก', 'warn'); return; }
-  const rows = [['device', 'alias', 'zone', 'timestamp', 'temp_c', 'humidity_pct', 'status', 'min_c', 'max_c']];
+  const rows = [['device', 'alias', 'zone', 'enabled', 'timestamp', 'temp_c', 'humidity_pct', 'status', 'min_c', 'max_c']];
   ids.forEach(id => {
     const d = devices[id];
     if (d.history.length) {
-      d.history.forEach(p => rows.push([id, devAlias(id), devZone(id), new Date(p.t).toISOString(), p.T, p.H, '', devMin(id), devMax(id)]));
+      d.history.forEach(p => rows.push([id, devAlias(id), devZone(id), devEnabled(id) ? 'yes' : 'no', new Date(p.t).toISOString(), p.T, p.H, '', devMin(id), devMax(id)]));
     } else {
-      rows.push([id, devAlias(id), devZone(id), d.lastTs ? new Date(d.lastTs).toISOString() : '', d.temp, d.hum, STATUS_META[statusOf(id)].label, devMin(id), devMax(id)]);
+      rows.push([id, devAlias(id), devZone(id), devEnabled(id) ? 'yes' : 'no', d.lastTs ? new Date(d.lastTs).toISOString() : '', d.temp, d.hum, STATUS_META[statusOf(id)].label, devMin(id), devMax(id)]);
     }
   });
   downloadCSV('room-climate-' + new Date().toISOString().slice(0, 19).replace(/[:T]/g, '-') + '.csv', rows);
@@ -1625,7 +1668,9 @@ function dailyFromLive(id, ym) {
 }
 
 async function collectReport(ym, zone) {
-  const ids = Object.keys(devices).filter(id => zone === 'ALL' || devZone(id) === zone).sort();
+  const ids = Object.keys(devices)
+    .filter(id => devEnabled(id) && (zone === 'ALL' || devZone(id) === zone))
+    .sort();
   const out = [];
   for (const id of ids) {
     let rows = [];
