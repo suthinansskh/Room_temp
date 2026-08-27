@@ -114,8 +114,11 @@ func (h *Hub) handleSSE(w http.ResponseWriter, r *http.Request) {
 // is configured it proxies that (server-side, so no browser CORS issue);
 // otherwise it returns the in-memory ring buffer.
 func (h *Hub) handleHistory(cfg Config) http.HandlerFunc {
+	// Apps Script rebuilds the daily/monthly report sheet before it answers, so
+	// an aggregate request regularly takes 10-15 s. Measured: ~11 s for one
+	// device. Anything under that turns a working endpoint into a 502.
 	httpc := &http.Client{
-		Timeout:   8 * time.Second,
+		Timeout:   45 * time.Second,
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: cfg.MQTTInsecure}},
 	}
 	return func(w http.ResponseWriter, r *http.Request) {

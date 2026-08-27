@@ -77,8 +77,8 @@ go build -o dashboard.exe .
   with no internet access needs those three assets vendored into `web/`.
 - Per-device monitoring is switched off in the sidebar's **เปิด/ปิดใช้งานอุปกรณ์**
   dialog. That is a browser-side display state: the server keeps ingesting and
-  the device keeps publishing — the card just stops counting toward the status
-  tiles, averages, alerts, and the monthly report.
+  the device keeps publishing — the card just leaves the grid and stops counting
+  toward the status tiles, averages, alerts, and the monthly report.
 - The firmware publishes command acks and sensor events to `<base>/<device>/ack`,
   which the server does not subscribe to (`<base>/+` and `<base>/+/status` do not
   match a three-level topic). `<base>/<device>/status` carries only online/offline.
