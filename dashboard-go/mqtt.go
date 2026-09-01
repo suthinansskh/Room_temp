@@ -11,14 +11,21 @@ import (
 )
 
 // reading mirrors the JSON payload the firmware publishes to <base>/<device>:
-//   {"device":"room1","temp":24.7,"hum":58,"rssi":-61,"ip":"...","uptime":1234,"fw":"1.4.0"}
+//
+//	{"device":"room1","temp":24.7,"hum":58,"rssi":-61,"ip":"...","uptime":1234,"fw":"1.7.0","ts":1787831872}
 type reading struct {
+	Ts     *int64   `json:"ts"` // unix seconds, set by firmware >= 1.7.0
 	Temp   *float64 `json:"temp"`
 	Hum    *float64 `json:"hum"`
 	RSSI   *int     `json:"rssi"`
 	Uptime *int64   `json:"uptime"`
 	IP     string   `json:"ip"`
 	FW     string   `json:"fw"`
+	// Set by firmware >= 1.8.0 while the DHT has stopped answering. The node
+	// keeps republishing its last good median, so without this the reading
+	// looks healthy; sensor_fault on <base>/<device>/ack says the same thing
+	// but is not retained, so a dashboard connecting later never sees it.
+	Fault bool `json:"fault"`
 }
 
 func startMQTT(cfg Config, h *Hub) mqtt.Client {

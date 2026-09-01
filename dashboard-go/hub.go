@@ -30,7 +30,12 @@ type Device struct {
 	FW       string   `json:"fw"`
 	LastTs   int64    `json:"lastTs"` // unix millis of last data message, 0 if none
 	Status   string   `json:"status"` // online | stale | offline | unknown
+	Fault    bool     `json:"fault"`  // sensor stopped answering; reading is frozen
 	Expected bool     `json:"expected"`
+
+	// Millis at which an LWT declared this device offline. A retained reading
+	// older than this must not clear that status -- see applyReading.
+	offlineAt int64
 
 	history []point
 }
@@ -101,6 +106,14 @@ func (h *Hub) applyReading(id string, r reading) {
 	h.mu.Lock()
 	d := h.device(id)
 	now := time.Now().UnixMilli()
+	// A retained payload can be days old, so prefer the reading time the
+	// firmware stamped (>= 1.7.0) over the moment it reached us. Values
+	// outside a sane window mean an unsynced device clock: ignore those.
+	if r.Ts != nil {
+		if ms := *r.Ts * 1000; ms > 1700000000000 && ms < now+3600000 {
+			now = ms
+		}
+	}
 	d.Temp = r.Temp
 	d.Hum = r.Hum
 	d.RSSI = r.RSSI
@@ -112,7 +125,28 @@ func (h *Hub) applyReading(id string, r reading) {
 		d.FW = r.FW
 	}
 	d.LastTs = now
-	d.Status = "online"
+	d.Fault = r.Fault
+	// On every (re)connect the broker replays two retained messages per device
+	// -- the last reading and the last status -- with no ordering guarantee
+	// between the two subscriptions. Since firmware 1.8.0 a node publishes a
+	// retained "offline" before every deliberate reboot, so that pair is the
+	// normal state of a rebooting device; letting the reading win would show a
+	// node that never came back as online and healthy. Only a reading taken
+	// after the device was declared offline may clear it. Firmware with no
+	// "ts" is stamped with arrival time, which is always newer, so it behaves
+	// exactly as before.
+	if d.Status != "offline" || now > d.offlineAt {
+		d.offlineAt = 0
+		// A stamped reading can already be older than the stale cutoff (a
+		// retained payload from a device that has since gone quiet), and a
+		// faulted sensor republishes a frozen value. Classify both now rather
+		// than flashing "online" until the next staleness sweep.
+		if d.Fault || time.Now().UnixMilli()-now > int64(h.staleSec)*1000 {
+			d.Status = "stale"
+		} else {
+			d.Status = "online"
+		}
+	}
 	d.history = append(d.history, point{T: float64(now), V: r.Temp, H: r.Hum})
 	if len(d.history) > h.historyMax {
 		d.history = d.history[len(d.history)-h.historyMax:]
@@ -127,8 +161,10 @@ func (h *Hub) applyStatus(id, state string) {
 	d := h.device(id)
 	if state == "online" {
 		d.Status = "online"
+		d.offlineAt = 0
 	} else if state == "offline" {
 		d.Status = "offline"
+		d.offlineAt = time.Now().UnixMilli()
 	}
 	// Other status payloads (e.g. "sensor_fault") are left as-is so the
 	// staleness pass can still classify the device by reading age.
@@ -167,7 +203,7 @@ func (h *Hub) refreshStaleness() {
 		}
 		if d.LastTs == 0 {
 			d.Status = "unknown"
-		} else if now-d.LastTs > cutoff {
+		} else if d.Fault || now-d.LastTs > cutoff {
 			d.Status = "stale"
 		} else {
 			d.Status = "online"

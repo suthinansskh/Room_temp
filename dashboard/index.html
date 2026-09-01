@@ -786,7 +786,8 @@ let activeId = null;    // device shown in the chart modal
 let demoMode = false;
 
 function blankDevice(id, expected = false) {
-  return { id, expected, temp:NaN, hum:NaN, rssi:null, uptime:null, ip:null, lastTs:0, link:'unknown', history:[], lastAlert:null };
+  return { id, expected, temp:NaN, hum:NaN, rssi:null, uptime:null, ip:null, lastTs:0, link:'unknown',
+           fault:false, offlineAt:0, history:[], lastAlert:null };
 }
 
 function cleanDeviceId(id) { return String(id).replace(/[^A-Za-z0-9_.-]/g, '').trim(); }
@@ -813,6 +814,10 @@ function seedExpected() {
 function linkStatus(d) {
   if (d.link === 'offline') return 'offline';
   if (!d.lastTs) return 'unknown';
+  // The node keeps republishing its last good median while the DHT is dead,
+  // and says so with "fault" on the retained payload. That is a loss of
+  // contact with the sensor, not a temperature reading worth alarming on.
+  if (d.fault) return 'stale';
   const staleSec = Math.max(5, parseInt(cfg.cfgStale || '45', 10));
   return ((Date.now() - d.lastTs) / 1000) > staleSec ? 'stale' : 'ok';
 }
@@ -1600,8 +1605,24 @@ function ingest(id, data) {
   d.rssi = data.rssi != null ? data.rssi : null;
   d.uptime = data.uptime != null ? data.uptime : null;
   if (data.ip) d.ip = data.ip;
-  d.lastTs = Date.now();
-  d.link = 'online';
+  // Firmware >= 1.7.0 stamps the reading (unix seconds, UTC). Retained
+  // payloads can be days old, so trust the device's time when it has one
+  // and only fall back to arrival time for older firmware.
+  const stamped = Number(data.ts);
+  d.lastTs = (stamped > 1700000000 && stamped < 4102444800) ? stamped * 1000 : Date.now();
+  d.fault = data.fault === true;
+  // On every (re)connect the broker replays two retained messages per device
+  // -- the last reading and the last status -- and MQTT guarantees no ordering
+  // between the two subscriptions. Since 1.8.0 a node publishes a retained
+  // "offline" before every deliberate reboot, so that pair is the normal state
+  // of a rebooting device; letting the reading win would show a node that
+  // never came back as online and healthy. Only a reading taken *after* we
+  // learned it went offline may bring it back. Firmware with no "ts" falls
+  // back to arrival time, which is always newer, so it behaves as before.
+  if (d.link !== 'offline' || d.lastTs > d.offlineAt) {
+    d.link = 'online';
+    d.offlineAt = 0;
+  }
   d.history.push({ t: d.lastTs, T: d.temp, H: d.hum });
   if (d.history.length > 300) d.history.shift();
   if (activeId === id && chartRange === 'live') redrawCharts();
@@ -1611,6 +1632,14 @@ function ingest(id, data) {
 
 function connect() {
   if (demoMode) return;
+  // mqtt.js is loaded from a CDN. On a network that blocks it the call below
+  // throws a ReferenceError nobody sees and the badge sits on "Connecting..."
+  // for ever, which looks identical to a wrong broker address.
+  if (typeof mqtt === 'undefined') {
+    setStatus('โหลด MQTT ไม่สำเร็จ', 'text-red-500', 'bg-red-500');
+    showToast('โหลด mqtt.js จาก CDN ไม่สำเร็จ — ตรวจอินเทอร์เน็ตหรือ proxy ของเครือข่าย', 'error');
+    return;
+  }
   if (!cfg.cfgHost) { setStatus('ยังไม่ตั้งค่า', 'text-amber-500', 'bg-amber-500'); return; }
   const url = 'wss://' + cfg.cfgHost + ':' + (cfg.cfgPort || 8884) + '/mqtt';
   setStatus('Connecting...', 'text-amber-500', 'bg-amber-500 animate-pulse');
@@ -1640,7 +1669,9 @@ function connect() {
 
     if (parts[2] === 'status') {
       const state = payload.toString();
-      devices[id].link = (state === 'online') ? 'online' : 'offline';
+      const dev = devices[id];
+      dev.link = (state === 'online') ? 'online' : 'offline';
+      dev.offlineAt = (dev.link === 'offline') ? Date.now() : 0;
       renderCard(id);
       refreshStaleness();
       return;

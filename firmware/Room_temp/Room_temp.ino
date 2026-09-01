@@ -9,6 +9,7 @@
  *  - DHT11 median-of-5 filter, sanity guard, and sensor watchdog
  *  - RTC-memory counters + /metrics endpoint
  *  - GPIO0 runtime: short-press = publish now, long-press 5s = wipe & reboot
+ *  - Firmware update three ways: ArduinoOTA, browser .bin upload, HTTP OTA pull
  *
  * Libraries (install via Library Manager):
  *   - WiFiManager by tzapu
@@ -29,6 +30,7 @@
 #include <ESP8266WebServer.h>
 #include <WiFiClientSecureBearSSL.h>
 #include <ESP8266HTTPClient.h>
+#include <ESP8266httpUpdate.h>
 #include <ESP8266mDNS.h>
 #include <ArduinoOTA.h>
 #include <DNSServer.h>
@@ -40,9 +42,10 @@
 #include <Adafruit_SSD1306.h>
 #include <ArduinoJson.h>
 #include <EEPROM.h>
+#include <time.h>
 #include "secrets.h"
 
-#define FW_VERSION "1.6.0"
+#define FW_VERSION "1.8.0"
 
 // Optional compiled-in Wi-Fi defaults. Define any of these in secrets.h to
 // pre-load known networks on every unit; leave undefined for portal-only setup.
@@ -64,6 +67,28 @@
 #endif
 #ifndef DEFAULT_WIFI3_PASS
 #define DEFAULT_WIFI3_PASS ""
+#endif
+
+// The captive portal answers on http://192.168.4.1 to anyone in radio range,
+// and everything it can do -- rewrite the broker, retype the Wi-Fi -- is a
+// change to a device someone else installed. Define PORTAL_AP_PASSWORD (8+
+// chars, same value on the whole fleet) in secrets.h to put WPA2 on the setup
+// AP; left empty the AP is open and the sketch warns about it on serial.
+#ifndef PORTAL_AP_PASSWORD
+#define PORTAL_AP_PASSWORD "admin123"
+#endif
+
+// Default "pull" firmware URL, e.g. http://10.0.0.5/room_temp/firmware.bin.
+// Per-device overridable in /config. Empty disables the HTTP OTA check.
+#ifndef DEFAULT_OTA_URL
+#define DEFAULT_OTA_URL ""
+#endif
+// Optional basic-auth credentials for that URL. Empty user = no auth header.
+#ifndef OTA_HTTP_USER
+#define OTA_HTTP_USER ""
+#endif
+#ifndef OTA_HTTP_PASS
+#define OTA_HTTP_PASS ""
 #endif
 
 // Number of stored Wi-Fi networks tried at boot (slot 0 = primary/scan-picked).
@@ -97,6 +122,7 @@ char gs_host[80]       = DEFAULT_GS_HOST;
 char gs_path[140]      = DEFAULT_GS_PATH;
 char project_id[24]    = DEFAULT_PROJECT;
 char device_id[24]     = DEFAULT_DEVICE_ID;
+char ota_url[140]      = DEFAULT_OTA_URL;          // http:// .bin for the HTTP OTA check
 
 // Up to WIFI_SLOTS saved networks. Slot 0 is the primary (set via the portal's
 // Wi-Fi scanner); slots 1..2 are extras typed in the portal / /config page.
@@ -134,10 +160,13 @@ struct Config {
   // v3 additions:
   char  wifi_ssid[WIFI_SLOTS][33];
   char  wifi_pass[WIFI_SLOTS][65];
+  // v4 additions:
+  char  ota_url[140];
 } cfg;
 const uint32_t CFG_MAGIC_V1 = 0xC0FFEE05;
 const uint32_t CFG_MAGIC_V2 = 0xC0FFEE06;
 const uint32_t CFG_MAGIC_V3 = 0xC0FFEE07;
+const uint32_t CFG_MAGIC_V4 = 0xC0FFEE08;
 
 // ESP8266 has ~512 B of RTC user memory that survives soft reboots
 // (not power-cycle). Used for boot/reconnect/fault counters so we don't
@@ -147,8 +176,11 @@ struct Stats {
   uint32_t boots;
   uint32_t mqttReconnects;
   uint32_t sensorFaults;
+  uint32_t sheetFails;
 };
-const uint32_t STATS_MAGIC = 0x53544154;  // 'STAT'
+// Bumped with the struct: a stale layout in RTC memory would be read as
+// garbage counters, so the old magic has to stop matching.
+const uint32_t STATS_MAGIC = 0x53544132;  // 'STA2'
 Stats stats;
 
 void statsLoad() {
@@ -158,6 +190,7 @@ void statsLoad() {
     stats.boots = 0;
     stats.mqttReconnects = 0;
     stats.sensorFaults = 0;
+    stats.sheetFails = 0;
   }
 }
 void statsSave() {
@@ -194,6 +227,13 @@ void loadConfig() {
     migrated = true;
   }
   if (cfg.magic == CFG_MAGIC_V1 || cfg.magic == CFG_MAGIC_V2 || cfg.magic == CFG_MAGIC_V3) {
+    // v4 adds the HTTP OTA URL. Seed it from the compiled-in default so a
+    // fleet upgraded over ArduinoOTA can pull its own updates from then on.
+    copyStr(cfg.ota_url, ota_url, sizeof(cfg.ota_url));
+    migrated = true;
+  }
+  if (cfg.magic == CFG_MAGIC_V1 || cfg.magic == CFG_MAGIC_V2 ||
+      cfg.magic == CFG_MAGIC_V3 || cfg.magic == CFG_MAGIC_V4) {
     copyStr(mqtt_server, cfg.mqtt_server, sizeof(mqtt_server));
     copyStr(mqtt_port_s, cfg.mqtt_port_s, sizeof(mqtt_port_s));
     copyStr(mqtt_user,   cfg.mqtt_user,   sizeof(mqtt_user));
@@ -208,12 +248,13 @@ void loadConfig() {
     copyStr(admin_pass,  cfg.admin_pass,  sizeof(admin_pass));
     memcpy(wifi_ssid, cfg.wifi_ssid, sizeof(wifi_ssid));
     memcpy(wifi_pass, cfg.wifi_pass, sizeof(wifi_pass));
+    copyStr(ota_url,     cfg.ota_url,     sizeof(ota_url));
   }
   if (migrated) saveConfig();
 }
 
 void saveConfig() {
-  cfg.magic = CFG_MAGIC_V3;
+  cfg.magic = CFG_MAGIC_V4;
   copyStr(cfg.mqtt_server, mqtt_server, sizeof(cfg.mqtt_server));
   copyStr(cfg.mqtt_port_s, mqtt_port_s, sizeof(cfg.mqtt_port_s));
   copyStr(cfg.mqtt_user,   mqtt_user,   sizeof(cfg.mqtt_user));
@@ -228,6 +269,7 @@ void saveConfig() {
   copyStr(cfg.admin_pass,  admin_pass,  sizeof(cfg.admin_pass));
   memcpy(cfg.wifi_ssid, wifi_ssid, sizeof(cfg.wifi_ssid));
   memcpy(cfg.wifi_pass, wifi_pass, sizeof(cfg.wifi_pass));
+  copyStr(cfg.ota_url,     ota_url,     sizeof(cfg.ota_url));
   EEPROM.begin(sizeof(Config));
   EEPROM.put(0, cfg);
   EEPROM.commit();
@@ -243,6 +285,17 @@ ESP8266WebServer server(80);
 BearSSL::WiFiClientSecure secureClient;
 PubSubClient mqtt(secureClient);
 ESP8266WiFiMulti wifiMulti;
+
+// Readings are timestamped from NTP. Without it a retained MQTT payload looks
+// brand new to a dashboard that just connected — a reading from two days ago
+// reads as "just now". 0 means the clock is not set yet, and the field is
+// then left out rather than published wrong.
+const time_t TIME_VALID_AFTER = 1700000000;   // 2023-11-14
+
+time_t epochNow() {
+  time_t t = time(nullptr);
+  return (t > TIME_VALID_AFTER) ? t : 0;
+}
 
 float lastTemp = NAN;
 float lastHum  = NAN;
@@ -261,6 +314,7 @@ bool needWifiWipe   = false;
 const unsigned long READ_INTERVAL    = 2000;        // 2s
 const unsigned long PUB_INTERVAL     = 10000;       // 10s MQTT
 const unsigned long SHEET_INTERVAL   = 1800000UL;   // 30 min Google Sheets
+const unsigned long SHEET_RETRY_MS   = 180000UL;    // 3 min after a failed POST
 const unsigned long SHIFT_INTERVAL   = 60000UL;     // 1 min OLED Y-shift toggle
 const unsigned long FAULT_REINIT_MS  = 300000UL;    // 5 min NaN → dht.begin()
 const unsigned long FAULT_REBOOT_MS  = 1800000UL;   // 30 min NaN → ESP.restart()
@@ -329,6 +383,21 @@ void publishAck(const char* msg) {
   mqtt.publish(topic, msg, false);
 }
 
+// Say goodbye before a deliberate restart. ESP.restart() drops the TCP session
+// without a DISCONNECT, so the broker only fires the retained LWT once the
+// keepalive expires -- 90 s here, during which every dashboard still shows the
+// node as online with a reading that is no longer being refreshed. Publishing
+// "offline" by hand closes that window; the reconnect republishes "online".
+void goOffline(const char* why) {
+  Serial.printf("Going offline: %s\n", why);
+  if (mqtt.connected()) {
+    publishStatus("offline");
+    mqtt.loop();          // let PubSubClient actually put the packet on the wire
+    mqtt.disconnect();
+  }
+  delay(120);
+}
+
 // ---------------- Sensor reading ----------------
 // Small insertion sort on the live samples; returns the middle one.
 float median5(const float* arr, uint8_t n) {
@@ -379,6 +448,7 @@ void sensorWatchdog() {
   if (age >= FAULT_REBOOT_MS) {
     Serial.println("Sensor dead > 30 min, restarting");
     oledMsg("Sensor fault", "Restarting...");
+    goOffline("sensor watchdog");
     delay(400);
     ESP.restart();
   }
@@ -394,6 +464,29 @@ void sensorWatchdog() {
 }
 
 // ---------------- Wi-Fi / Portal ----------------
+// Injected after WiFiManager's own stylesheet so these rules win. Same visual
+// language as /config, so the portal and the device page do not look like two
+// different products to whoever is installing the node.
+static const char PORTAL_CSS[] PROGMEM =
+  "<style>"
+  "body{background:#0f1218;color:#edf1f5;font-family:system-ui,Segoe UI,sans-serif;padding:18px 12px}"
+  ".wrap{max-width:460px;min-width:0;width:100%;text-align:left}"
+  "h1{font-size:1.3rem;margin:4px 0 2px;color:#9fb8ff}"
+  "h3{font-size:.78rem;font-weight:500;color:#9aa7b7;margin:0 0 16px}"
+  "label{display:block;font-size:.72rem;color:#9aa7b7;margin:10px 0 4px}"
+  "input{background:#10151d;border:1px solid #2b3444;border-radius:8px;color:#edf1f5;"
+  "padding:10px;font-size:.9rem;width:100%;box-sizing:border-box}"
+  "input:focus{border-color:#9fb8ff;outline:none}"
+  "button{background:#9fb8ff;color:#0d1320;border:0;border-radius:8px;padding:12px;"
+  "font-size:.85rem;font-weight:700;line-height:1.4;cursor:pointer;width:100%}"
+  "button.D{background:#171c25;color:#ff9d9d;border:1px solid #6b2233}"
+  "a{color:#9fb8ff;font-weight:600;text-decoration:none}"
+  "hr{border:0;border-top:1px solid #2b3444;margin:16px 0}"
+  ".msg{background:#171c25;border:1px solid #2b3444;border-left:4px solid #9fb8ff;"
+  "border-radius:8px;padding:14px;color:#c8d2de;font-size:.85rem}"
+  ".q{filter:invert(1) opacity(.55)}"
+  "</style>";
+
 // Register every non-empty saved network with WiFiMulti, plus whatever the
 // SDK persisted (covers pre-1.5 firmware where the slots may be blank but a
 // primary AP is still stored in flash). WiFiMulti then connects to the
@@ -412,6 +505,20 @@ void buildWifiList() {
 void startPortal() {
   WiFiManager wm;
   wm.setSaveConfigCallback(saveConfigCallback);
+  wm.setTitle("Room Temp Sensor");
+
+  // WiFiManager keeps only the pointer, so the String has to outlive the
+  // portal -- a temporary would leave setCustomHeadElement() dangling. Static
+  // and filled here, so the 1 KB of CSS costs nothing on a normal boot.
+  static String portalHead;
+  portalHead = FPSTR(PORTAL_CSS);
+  wm.setCustomHeadElement(portalHead.c_str());
+
+  // Deliberately no "update" or "erase": the default menu exposes firmware
+  // upload and a credential wipe to anyone within radio range of an
+  // unconfigured node. Both live behind the authenticated /config page instead.
+  const char* portalMenu[] = { "wifi", "info", "sep", "restart" };
+  wm.setMenu(portalMenu, 4);
 
   WiFiManagerParameter p_mqtt_server("mqtts", "MQTT host",     mqtt_server, 64);
   WiFiManagerParameter p_mqtt_port  ("mqttp", "MQTT port",     mqtt_port_s, 6);
@@ -449,7 +556,13 @@ void startPortal() {
 
   // Always config mode: ensureWifi() only calls us when we actually need the
   // portal (multi-connect failed or the FLASH button forced it).
-  bool ok = wm.startConfigPortal("RoomTemp-Setup");
+  bool ok;
+  if (strlen(PORTAL_AP_PASSWORD) >= 8) {
+    ok = wm.startConfigPortal("RoomTemp-Setup", PORTAL_AP_PASSWORD);
+  } else {
+    Serial.println("WARNING: setup AP is OPEN - set PORTAL_AP_PASSWORD (8+ chars) in secrets.h");
+    ok = wm.startConfigPortal("RoomTemp-Setup");
+  }
   if (!ok) {
     oledMsg("WiFi timeout", "Retrying...");
     delay(1500); ESP.restart();
@@ -562,10 +675,34 @@ void publishMQTT(float t, float h) {
   IPAddress ip = WiFi.localIP();
   char ipbuf[16];
   snprintf(ipbuf, sizeof(ipbuf), "%u.%u.%u.%u", ip[0], ip[1], ip[2], ip[3]);
-  char buf[224];
+  // The payload is retained, so a subscriber may pick it up days later. "ts"
+  // (unix seconds, UTC) lets it show the real age instead of the arrival time.
+  //
+  // It stamps when the sample was *taken*, not when this packet goes out. A
+  // dead DHT does not clear lastTemp, so the node keeps republishing its last
+  // good median every 10 s; stamping those with the publish time made a frozen
+  // reading look freshly measured for the full 30 min before the watchdog
+  // reboots. Dated from lastValidReadMs it goes stale in every dashboard
+  // within the normal stale window instead.
+  char tsField[24] = "";
+  time_t ep = epochNow();
+  if (ep) {
+    time_t readEp = ep - (time_t)((millis() - lastValidReadMs) / 1000);
+    snprintf(tsField, sizeof(tsField), ",\"ts\":%lu", (unsigned long)readEp);
+  }
+
+  // Says *why* the reading stopped moving. The sensor_fault ack carries the
+  // same news on <base>/<device>/ack, but that topic is not retained, so a
+  // dashboard that connects afterwards never sees it -- this field is on the
+  // retained payload and is still there when someone opens the page an hour
+  // later.
+  const char* faultField = sensorFaultActive ? ",\"fault\":true" : "";
+
+  char buf[256];
   int n = snprintf(buf, sizeof(buf),
-    "{\"device\":\"%s\",\"temp\":%.1f,\"hum\":%.0f,\"rssi\":%d,\"ip\":\"%s\",\"uptime\":%lu,\"fw\":\"%s\"}",
-    device_id, t, h, WiFi.RSSI(), ipbuf, (unsigned long)(millis() / 1000), FW_VERSION);
+    "{\"device\":\"%s\",\"temp\":%.1f,\"hum\":%.0f,\"rssi\":%d,\"ip\":\"%s\",\"uptime\":%lu,\"fw\":\"%s\"%s%s}",
+    device_id, t, h, WiFi.RSSI(), ipbuf, (unsigned long)(millis() / 1000), FW_VERSION,
+    tsField, faultField);
   if (n < 0 || n >= (int)sizeof(buf)) return;
   char topic[80];
   snprintf(topic, sizeof(topic), "%s/%s", mqtt_base, device_id);
@@ -584,8 +721,26 @@ void pumpLoops() {
   ArduinoOTA.handle();
 }
 
-void postToSheet(float t, float h) {
-  StaticJsonDocument<256> doc;
+// Returns false when the row did not make it, so the caller can retry the
+// slot instead of waiting another SHEET_INTERVAL.
+//
+// Note: "ts" is deliberately NOT sent. The Apps Script stamps the row itself
+// (`if (!data.ts) data.ts = new Date()`), and a device whose clock is wrong
+// would poison the historical record that the daily/monthly reports group on.
+bool postToSheet(float t, float h) {
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("GS skipped: no Wi-Fi");
+    return false;
+  }
+  // A TLS handshake with a 4 KB receive buffer needs roughly 12-14 KB of
+  // contiguous heap on top of the session MQTT already holds. Below that it
+  // fails anyway, and trying can take the whole sketch down with it.
+  if (ESP.getMaxFreeBlockSize() < 14000) {
+    Serial.printf("GS skipped: largest free block %u B\n", ESP.getMaxFreeBlockSize());
+    return false;
+  }
+
+  StaticJsonDocument<320> doc;
   doc["project"] = project_id;
   doc["device"]  = device_id;
   doc["temp"]    = t;
@@ -609,7 +764,7 @@ void postToSheet(float t, float h) {
     String url = String("https://") + host + path;
     if (!https.begin(client, url)) {
       Serial.printf("GS begin fail (hop %d) %s\n", hop, url.c_str());
-      return;
+      return false;
     }
     https.addHeader("Content-Type", "application/json");
     const char* collect[] = { "Location" };
@@ -623,22 +778,87 @@ void postToSheet(float t, float h) {
       https.end();
       if (!loc.startsWith("https://")) {
         Serial.printf("GS redirect not https: '%s'\n", loc.c_str());
-        return;
+        return false;
       }
       int slash = loc.indexOf('/', 8);
-      if (slash < 0) { Serial.println("GS redirect URL has no path"); return; }
+      if (slash < 0) { Serial.println("GS redirect URL has no path"); return false; }
       host = loc.substring(8, slash);
       path = loc.substring(slash);
       continue;
     }
 
-    if (code > 0 && code < 400) {
+    bool ok = (code >= 200 && code < 300);
+    if (ok) {
       Serial.printf("GS body: %s\n", https.getString().c_str());
     }
     https.end();
-    return;
+    return ok;
   }
   Serial.println("GS too many redirects");
+  return false;
+}
+
+// ---------------- HTTP OTA (pull) ----------------
+// ArduinoOTA needs a laptop running espota; this pulls instead, so ten boards
+// update themselves from one .bin on an internal web server.
+//
+// The update server decides whether a check installs anything: ESP8266httpUpdate
+// sends the running version in x-ESP8266-version and the server must answer 304
+// when it matches. A server that answers 200 to everything turns every check
+// into a reflash-and-reboot, which is why the first check waits for ten minutes
+// of uptime and the rest are six hours apart -- a node caught in that loop still
+// spends ten minutes reporting temperatures between attempts instead of none.
+const unsigned long OTA_CHECK_INTERVAL    = 21600000UL;  // 6 h between checks
+const unsigned long OTA_FIRST_CHECK_DELAY = 600000UL;    // 10 min of uptime first
+unsigned long lastOtaCheckMs = 0;
+char otaStatus[56] = "not checked yet";                  // surfaced on /metrics
+
+void checkHttpOTA() {
+  if (!ota_url[0])                  { copyStr(otaStatus, "no URL configured", sizeof(otaStatus)); return; }
+  if (WiFi.status() != WL_CONNECTED){ copyStr(otaStatus, "skipped: no Wi-Fi", sizeof(otaStatus)); return; }
+  // Plain HTTP only. A TLS pull would want its own BearSSL buffers on top of
+  // the MQTT session, which is exactly the heap squeeze postToSheet() already
+  // works around; serve the .bin from the LAN instead.
+  if (strncmp(ota_url, "http://", 7) != 0) {
+    copyStr(otaStatus, "skipped: URL must be http://", sizeof(otaStatus));
+    Serial.println("OTA: only http:// URLs are supported");
+    return;
+  }
+  if (ESP.getMaxFreeBlockSize() < 10000) {
+    copyStr(otaStatus, "skipped: low heap", sizeof(otaStatus));
+    return;
+  }
+
+  Serial.printf("OTA: checking %s (running %s)\n", ota_url, FW_VERSION);
+  oledMsg("Firmware", "Checking...");
+  pumpLoops();
+
+  WiFiClient client;
+  // No setLedPin() here: LED_BUILTIN is GPIO2, which is the DHT data line on
+  // this wiring -- blinking it would drive the sensor bus during the download.
+  ESPhttpUpdate.rebootOnUpdate(false);   // we announce "offline" first, then reboot
+  if (strlen(OTA_HTTP_USER) > 0) ESPhttpUpdate.setAuthorization(OTA_HTTP_USER, OTA_HTTP_PASS);
+
+  t_httpUpdate_return ret = ESPhttpUpdate.update(client, String(ota_url), FW_VERSION);
+  switch (ret) {
+    case HTTP_UPDATE_OK:
+      copyStr(otaStatus, "updated, rebooting", sizeof(otaStatus));
+      Serial.println("OTA: updated, rebooting");
+      oledMsg("Firmware", "Updated", "Rebooting...");
+      goOffline("http ota");
+      ESP.restart();
+      break;
+    case HTTP_UPDATE_NO_UPDATES:
+      copyStr(otaStatus, "up to date", sizeof(otaStatus));
+      Serial.println("OTA: already up to date");
+      break;
+    case HTTP_UPDATE_FAILED:
+    default:
+      snprintf(otaStatus, sizeof(otaStatus), "failed (%d)", ESPhttpUpdate.getLastError());
+      Serial.printf("OTA: failed (%d) %s\n", ESPhttpUpdate.getLastError(),
+                    ESPhttpUpdate.getLastErrorString().c_str());
+      break;
+  }
 }
 
 // ---------------- Web Server ----------------
@@ -684,7 +904,7 @@ void copyArg(char* target, size_t targetSize, const String& name) {
 void handleRoot()  { server.send_P(200, "text/html", INDEX_HTML); }
 
 void handleApi() {
-  StaticJsonDocument<224> doc;
+  StaticJsonDocument<320> doc;
   doc["device"] = device_id;
   if (isnan(lastTemp)) doc["temp"] = nullptr; else doc["temp"] = lastTemp;
   if (isnan(lastHum))  doc["hum"]  = nullptr; else doc["hum"]  = lastHum;
@@ -694,16 +914,21 @@ void handleApi() {
   doc["mqtt"]   = mqtt.connected();
   doc["fault"]  = sensorFaultActive;
   doc["fw"]     = FW_VERSION;
+  time_t apiEp = epochNow();
+  if (apiEp) doc["ts"] = (uint32_t)apiEp; else doc["ts"] = nullptr;
   String s; serializeJson(doc, s);
   server.send(200, "application/json", s);
 }
 
 void handleMetrics() {
   if (!requireAuth()) return;
-  StaticJsonDocument<256> doc;
+  StaticJsonDocument<448> doc;
   doc["boots"]            = stats.boots;
   doc["mqtt_reconnects"]  = stats.mqttReconnects;
   doc["sensor_faults"]    = stats.sensorFaults;
+  doc["sheet_fails"]      = stats.sheetFails;
+  doc["clock_ok"]         = epochNow() != 0;
+  doc["ota"]              = otaStatus;
   doc["free_heap"]        = ESP.getFreeHeap();
   doc["max_free_block"]   = ESP.getMaxFreeBlockSize();
   doc["heap_frag"]        = ESP.getHeapFragmentation();
@@ -717,7 +942,7 @@ void handleMetrics() {
 void handleConfigPage() {
   if (!requireAuth()) return;
   String html;
-  html.reserve(8200);
+  html.reserve(11000);
   html += F("<!doctype html><html><head><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>");
   html += F("<title>Room Temp Config</title><style>");
   html += F(":root{--bg:#0f1218;--panel:#171c25;--line:#2b3444;--text:#edf1f5;--mut:#9aa7b7;--acc:#9fb8ff}");
@@ -739,6 +964,8 @@ void handleConfigPage() {
   html += F("<label>MQTT base topic<input name='mqtt_base' maxlength='39' value='"); html += htmlEscape(mqtt_base); html += F("'></label>");
   html += F("<label>Google Script host<input name='gs_host' maxlength='79' value='"); html += htmlEscape(gs_host); html += F("'></label>");
   html += F("</div><label>Google Script path<input name='gs_path' maxlength='139' value='"); html += htmlEscape(gs_path); html += F("'></label>");
+  html += F("<label>Firmware URL (.bin)<small>Plain http:// on the LAN; blank disables the update check</small><input name='ota_url' maxlength='139' value='");
+  html += htmlEscape(ota_url); html += F("'></label>");
   html += F("<p style='color:var(--text);margin:14px 0 0'>Wi-Fi networks <small style='color:var(--mut)'>&mdash; auto-connects to the strongest in range</small></p><div class='grid'>");
   char wn[8];
   for (uint8_t i = 0; i < WIFI_SLOTS; i++) {
@@ -760,7 +987,25 @@ void handleConfigPage() {
   html += F("<label>Humidity offset (%)<input name='hum_offset' value='"); html += off; html += F("'></label>");
   html += F("<label>Admin password<small>Blank = keep current (defaults to OTA password)</small><input name='admin_pass' maxlength='23' type='password'></label>");
   html += F("</div><div class='actions'><button type='submit'>Save and restart</button><a class='btn' href='/'>Dashboard</a><a class='btn' href='/api'>API</a><a class='btn' href='/metrics'>Metrics</a></div>");
-  html += F("</form></div></main></body></html>");
+  html += F("</form></div>");
+
+  // Its own card, outside the settings form: a file input cannot ride along in
+  // the same POST, and flashing an image is a different intent from saving
+  // settings. This path needs no update server at all, which is what makes it
+  // usable from a laptop standing next to the device.
+  html += F("<div class='card' style='margin-top:14px'><h1>Firmware</h1><p>Running <code>" FW_VERSION
+            "</code> &middot; last update check: <code>");
+  html += htmlEscape(otaStatus);
+  html += F("</code></p>");
+  html += F("<form method='post' action='/update' enctype='multipart/form-data'>"
+            "<label>Upload a .bin built for this board<input type='file' name='fw' accept='.bin' required></label>"
+            "<div class='actions'><button type='submit' onclick=\"return confirm('Flash this file now? The device reboots when done.')\">"
+            "Upload &amp; flash</button></div></form>");
+  html += F("<form method='post' action='/ota/check'><div class='actions'>"
+            "<button type='submit' onclick=\"return confirm('Check the firmware URL now?')\">Check firmware URL now</button>"
+            "</div></form>");
+  html += F("<small>The pull check also runs on its own after 10 min of uptime, then every 6 h.</small>");
+  html += F("</div></main></body></html>");
   server.send(200, "text/html", html);
 }
 
@@ -777,6 +1022,7 @@ void handleConfigSave() {
   copyArg(mqtt_base, sizeof(mqtt_base), "mqtt_base");
   copyArg(gs_host,   sizeof(gs_host),   "gs_host");
   copyArg(gs_path,   sizeof(gs_path),   "gs_path");
+  copyArg(ota_url,   sizeof(ota_url),   "ota_url");   // blank disables the check
   if (server.hasArg("temp_offset")) temp_offset = server.arg("temp_offset").toFloat();
   if (server.hasArg("hum_offset"))  hum_offset  = server.arg("hum_offset").toFloat();
   if (server.hasArg("admin_pass") && server.arg("admin_pass").length() > 0) {
@@ -793,6 +1039,7 @@ void handleConfigSave() {
   }
   saveConfig();
   server.send(200, "text/html", "<!doctype html><meta name='viewport' content='width=device-width,initial-scale=1'><body style='font-family:system-ui;background:#0f1218;color:#edf1f5;padding:2rem'><h1>Saved</h1><p>Restarting device...</p></body>");
+  goOffline("config saved");
   delay(600);
   ESP.restart();
 }
@@ -800,9 +1047,81 @@ void handleConfigSave() {
 void handleReset() {
   if (!requireAuth()) return;
   server.send(200, "text/plain", "Erasing Wi-Fi & restarting...");
-  delay(300);
+  goOffline("wifi reset");
   WiFi.disconnect(true);
   ESP.restart();
+}
+
+void handleOtaCheck() {
+  if (!requireAuth()) return;
+  server.send(200, "text/html",
+    "<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<body style='font-family:system-ui;background:#0f1218;color:#edf1f5;padding:2rem'>"
+    "<h1>Checking firmware URL</h1><p>If a newer image is served the device flashes it and reboots.</p>"
+    "<script>setTimeout(function(){location='/config';},30000)</script></body>");
+  delay(200);
+  checkHttpOTA();
+}
+
+// The upload handler streams before the route handler runs, so without a check
+// of its own an unauthenticated client could push a whole image into the OTA
+// partition and only be refused afterwards.
+bool uploadAuthorized = false;
+// Set only when a whole image was actually written. Without it a POST to
+// /update carrying no file at all would reach handleUploadDone() with the
+// flags left over from the previous upload and reboot a device that was
+// never reflashed.
+bool uploadComplete = false;
+
+/** Streams the posted image straight into the OTA partition. */
+void handleUploadData() {
+  HTTPUpload& up = server.upload();
+
+  if (up.status == UPLOAD_FILE_START) {
+    uploadAuthorized = server.authenticate(ADMIN_USER, adminPassActive());
+    uploadComplete = false;
+    if (!uploadAuthorized) { Serial.println("Upload rejected: not authorised"); return; }
+    Serial.printf("Upload starting: %s\n", up.filename.c_str());
+    oledMsg("Firmware", "Uploading...");
+    goOffline("firmware upload");
+    uint32_t maxSketch = (ESP.getFreeSketchSpace() - 0x1000) & 0xFFFFF000;
+    if (!Update.begin(maxSketch)) Update.printError(Serial);
+  } else if (up.status == UPLOAD_FILE_WRITE) {
+    if (!uploadAuthorized) return;
+    if (Update.write(up.buf, up.currentSize) != up.currentSize) Update.printError(Serial);
+  } else if (up.status == UPLOAD_FILE_END) {
+    if (!uploadAuthorized) return;
+    if (Update.end(true)) {
+      uploadComplete = true;
+      Serial.printf("Upload done: %u bytes\n", up.totalSize);
+    } else {
+      Update.printError(Serial);
+    }
+  } else if (up.status == UPLOAD_FILE_ABORTED) {
+    Update.end();
+    uploadComplete = false;
+    Serial.println("Upload aborted");
+  }
+}
+
+/** Runs once the whole .bin has arrived. Answers first, then reboots, so the
+ *  browser gets a page instead of a dropped connection. */
+void handleUploadDone() {
+  if (!requireAuth()) return;
+  bool ok = uploadAuthorized && uploadComplete && !Update.hasError();
+  server.sendHeader("Connection", "close");
+  server.send(200, "text/html", String(
+    "<!doctype html><meta charset='utf-8'><meta name='viewport' content='width=device-width,initial-scale=1'>"
+    "<body style='font-family:system-ui;background:#0f1218;color:#edf1f5;padding:2rem'>") +
+    (ok ? "<h1 style='color:#8ee6a0'>Update complete</h1><p>Rebooting into the new firmware...</p>"
+          "<script>setTimeout(function(){location='/';},15000)</script>"
+        : "<h1 style='color:#ff9d9d'>Update failed</h1><p>The image was rejected. The old firmware is still running.</p>"
+          "<script>setTimeout(function(){location='/config';},5000)</script>") +
+    "</body>");
+  if (!ok) { oledMsg("Firmware", "Upload failed"); uploadAuthorized = false; return; }
+  oledMsg("Firmware", "Updated", "Rebooting...");
+  delay(500);
+  ESP.restart();   // goOffline() already ran when the upload started
 }
 
 // ---------------- Button (runtime) ----------------
@@ -854,6 +1173,9 @@ void setup() {
   bool force = (digitalRead(BOOT_BTN) == LOW);
   ensureWifi(force);
 
+  // UTC epoch; the Apps Script and the dashboards do their own formatting.
+  configTime(0, 0, "pool.ntp.org", "time.google.com");
+
   oledMsg("WiFi OK", WiFi.SSID(), WiFi.localIP().toString());
   Serial.print("IP: "); Serial.println(WiFi.localIP());
 
@@ -881,6 +1203,8 @@ void setup() {
   server.on("/config",      HTTP_GET,  handleConfigPage);
   server.on("/config/save", HTTP_POST, handleConfigSave);
   server.on("/reset",       HTTP_POST, handleReset);
+  server.on("/ota/check",   HTTP_POST, handleOtaCheck);
+  server.on("/update",      HTTP_POST, handleUploadDone, handleUploadData);
   server.begin();
 
   // ---------------- OTA ----------------
@@ -892,6 +1216,10 @@ void setup() {
     String type = (ArduinoOTA.getCommand() == U_FLASH) ? "sketch" : "filesystem";
     Serial.println("OTA start: " + type);
     oledMsg("OTA Update", "Starting...", type);
+    // The reboot at the end of a successful flash is not a clean disconnect,
+    // so hand the broker an "offline" now rather than leaving the dashboard
+    // showing a live node for a keepalive period.
+    goOffline("arduino ota");
   });
   ArduinoOTA.onEnd([]() {
     Serial.println("\nOTA end");
@@ -953,13 +1281,29 @@ void loop() {
   // First valid reading triggers an immediate POST; thereafter every SHEET_INTERVAL.
   if (!isnan(lastTemp) && (lastSheetMs == 0 || now - lastSheetMs > SHEET_INTERVAL)) {
     lastSheetMs = now;
-    postToSheet(lastTemp, lastHum);
+    if (!postToSheet(lastTemp, lastHum)) {
+      // Come back in SHEET_RETRY_MS rather than losing this half-hour of
+      // history to one failed handshake. Unsigned wrap is fine here: the
+      // difference the comparison above computes stays correct.
+      lastSheetMs = now - (SHEET_INTERVAL - SHEET_RETRY_MS);
+      stats.sheetFails++;
+      statsSave();
+    }
+  }
+
+  // HTTP OTA: first check once the node has been up for 10 min, then every
+  // 6 h. Never at boot -- see the note on OTA_CHECK_INTERVAL.
+  if (ota_url[0] && now > OTA_FIRST_CHECK_DELAY &&
+      (lastOtaCheckMs == 0 || now - lastOtaCheckMs > OTA_CHECK_INTERVAL)) {
+    lastOtaCheckMs = now;
+    checkHttpOTA();
   }
 
   // Deferred actions — handled here so we never reboot mid-publish.
   if (needWifiWipe) {
     Serial.println("Long-press: wiping Wi-Fi credentials");
     oledMsg("WiFi reset", "Long press", "Rebooting...");
+    goOffline("wifi wipe");
     WiFi.disconnect(true);
     delay(400);
     ESP.restart();
@@ -967,6 +1311,7 @@ void loop() {
   if (needReboot) {
     Serial.println("MQTT cmd: reboot");
     oledMsg("Reboot", "MQTT cmd");
+    goOffline("mqtt cmd");
     delay(400);
     ESP.restart();
   }

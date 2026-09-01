@@ -31,8 +31,12 @@ The dashboard subscribes to `room/+` and `room/+/status`. To add an 11th device,
 Payload (retained on each device topic):
 
 ```json
-{ "device":"room3", "temp":24.7, "hum":58, "rssi":-61, "uptime":1234 }
+{ "device":"room3", "temp":24.7, "hum":58, "rssi":-61, "ip":"192.168.1.50", "uptime":1234, "fw":"1.8.0", "ts":1787831872 }
 ```
+
+`ts` is unix seconds (UTC) from NTP and is omitted while the clock is unset. It stamps when the sample was **taken**, not when the packet went out. Because the payload is retained, a subscriber that connects days later reads the real reading time from it instead of assuming the message just arrived.
+
+`fault` is present and `true` only while the DHT has stopped answering. The node does not clear its last good median, so it keeps republishing that value every 10 s; the stamped sample time makes it go stale in every dashboard within the normal stale window, and `fault` says why. The same news goes out as `sensor_fault` on `<base>/<device>/ack`, but that topic is not retained — a dashboard that connects afterwards would never see it.
 
 Status messages are `online` / `offline` (LWT-based) and are also retained. Nothing else is ever published there, so a subscriber can read `<base>/<device>/status` as a plain online flag.
 
@@ -112,7 +116,7 @@ pio run -e d1_mini   -t upload
 
 ### First boot (either toolchain)
 
-On first boot the device creates the AP **`RoomTemp-Setup`**. Connect, open `http://192.168.4.1`, pick your primary Wi-Fi (**Wi-Fi #1**), and fill in:
+On first boot the device creates the AP **`RoomTemp-Setup`**, protected with `PORTAL_AP_PASSWORD` from [secrets.h.example](firmware/Room_temp/secrets.h.example) — leave that undefined and the setup AP is open to anyone in radio range. Connect, open `http://192.168.4.1`, pick your primary Wi-Fi (**Wi-Fi #1**), and fill in:
 
 - **MQTT host** — your HiveMQ cluster, e.g. `xxxxx.s1.eu.hivemq.cloud`
 - **MQTT port** — `8883`
@@ -137,6 +141,26 @@ Set the networks any of three ways:
 - **`/config` page** — edit all three SSID/password slots on a running device (clear an SSID to disable that slot).
 - **Compile-time defaults** — `DEFAULT_WIFI{1,2,3}_SSID/PASS` in `secrets.h`, so a whole fleet ships pre-loaded with the known office APs (see [secrets.h.example](firmware/Room_temp/secrets.h.example)).
 
+### Firmware 1.8.0 — four ways to flash, and a setup portal that isn't wide open
+
+- **Flash from a browser.** The `/config` page now carries an upload form: `POST /update` takes a `.bin` and streams it straight into the OTA partition — no espota, no PlatformIO, no update server, just a laptop standing next to the board. The stream is authenticated *before* the first chunk is accepted, not after the whole image has been pushed.
+- **Or let the fleet pull.** With a **Firmware URL** set in `/config` (plain `http://` on the LAN — e.g. the `\\14.11.0.85\Drug\AutoPrint\IOT\Roomtemp` share served over HTTP), each node checks that `.bin` after 10 minutes of uptime and every 6 h after, and `POST /ota/check` runs the check on demand. The request carries the running version in `x-ESP8266-version`, so **the update server must answer `304` when it matches** — one that answers `200` to everything turns every check into a reflash-and-reboot. That is exactly why the first check waits ten minutes instead of running at boot: a node caught in that loop still spends ten minutes reporting temperatures between attempts. `/metrics` reports the last result as `ota`.
+- HTTPS firmware URLs are deliberately not supported: a TLS pull wants its own BearSSL buffers on top of the MQTT session, which is the same heap squeeze `postToSheet()` already works around.
+- **The setup portal is no longer an open door.** `RoomTemp-Setup` takes WPA2 from `PORTAL_AP_PASSWORD`, and its menu is cut down to `wifi / info / restart` — WiFiManager's default menu offers a firmware upload and a credential wipe to anyone within radio range of an unconfigured node. Both live behind the authenticated `/config` page instead. The portal also picks up the same dark theme as `/config`, so the two pages stop looking like different products.
+- **A deliberate reboot says goodbye.** `ESP.restart()` drops the TCP session without a DISCONNECT, so the broker only fired the retained LWT once the 90 s keepalive expired — a minute and a half of every dashboard showing a rebooting node as online, with a reading that had stopped refreshing. Config save, Wi-Fi reset and wipe, the `reboot` command, the sensor watchdog, ArduinoOTA and both update paths now publish `offline` and disconnect first.
+- **A retained reading no longer resurrects a device the broker called offline.** On every (re)connect the broker replays two retained messages per node — the last reading and the last status — and MQTT guarantees no ordering between the two subscriptions. Both dashboards forced the device back to *online* on any reading, overriding the LWT they otherwise treat as authoritative. That window used to be rare; now that every deliberate reboot publishes a retained `offline` first, "retained offline + retained fresh reading" is the *normal* state of a rebooting node — exactly the state where one that never comes back must not read as healthy. A reading now clears `offline` only if it was taken after the device was declared offline ([dashboard/index.html](dashboard/index.html), [dashboard-go/hub.go](dashboard-go/hub.go)).
+- **A dead sensor is visible again.** `ts` is dated from the last valid sample instead of the publish time, so a frozen reading goes stale on its own instead of looking freshly measured for the 30 min until the watchdog reboots; `fault` on the retained payload carries the reason. Both dashboards classify a faulted node as **ขาดการติดต่อ** rather than raising a temperature alarm.
+- **The dashboard says when its MQTT library never loaded.** `mqtt.js` comes from a CDN; on a network that blocks it the connect call threw a `ReferenceError` nobody saw and the badge sat on "Connecting..." for ever, indistinguishable from a wrong broker address.
+- EEPROM config migrates v3 → v4 in place (it adds the firmware URL), so this flashes over any 1.4.x–1.7.x board.
+
+### Firmware 1.7.0 — timestamps and a Sheets POST that retries
+
+- **Readings carry their own time.** The device syncs NTP (UTC) and adds `ts` to the retained MQTT payload. Before this, a dashboard connecting to the broker read a retained reading from two days ago as "just now" — the age shown was really the arrival time. Both dashboards now trust `ts` when it is present and sane, and fall back to arrival time for older firmware.
+- **A failed Sheets POST no longer costs half an hour of history.** `postToSheet()` returns a result, and a failure re-arms the timer for 3 minutes instead of the full 30. Failures are counted in `sheet_fails` on `/metrics`.
+- **The POST is skipped when it cannot work**: no Wi-Fi, or less than 14 KB of contiguous heap for the TLS handshake on top of the session MQTT holds. Both count as a failure, so the retry above picks the slot back up.
+- `ts` is deliberately *not* sent to Apps Script: the script stamps rows itself (`if (!data.ts) data.ts = new Date()`), and a device with a wrong clock would corrupt the timestamps the daily/monthly reports group on.
+- `/metrics` also reports `clock_ok`; the JSON documents got more headroom.
+
 ### Firmware 1.6.0 — reliability fixes
 
 Flash this over any 1.4.x/1.5.x board; EEPROM config migrates in place.
@@ -153,12 +177,16 @@ Settings persist in EEPROM. To re-run the portal: `POST` to `http://<device-ip>/
 Local endpoints once connected:
 
 - `http://<ip>/` — small status page (auto-refreshing)
-- `http://<ip>/api` — JSON `{device, temp, hum, rssi, ip, uptime, mqtt, fault, fw}` (`temp`/`hum` are `null`, not `0`, when the DHT has no valid reading)
+- `http://<ip>/api` — JSON `{device, temp, hum, rssi, ip, uptime, mqtt, fault, fw, ts}` (`temp`/`hum` are `null`, not `0`, when the DHT has no valid reading)
 - `http://<ip>/config` — settings form (admin auth; GET to view, POST to save)
-- `http://<ip>/metrics` — JSON diagnostics: boots, reconnects, sensor faults, heap (admin auth)
+- `http://<ip>/metrics` — JSON diagnostics: boots, reconnects, sensor faults, failed Sheets posts, clock sync, heap (admin auth)
 - `POST http://<ip>/reset` — wipe Wi-Fi creds and reboot (admin auth)
+- `POST http://<ip>/update` — upload a `.bin` and flash it (admin auth; multipart field `fw`)
+- `POST http://<ip>/ota/check` — pull-check the configured firmware URL now (admin auth)
 
-Write endpoints (`/config/save`, `/reset`, `/metrics`) use HTTP Basic auth — user `admin`, password from the `/config` **Admin password** field, falling back to `OTA_PASSWORD`.
+Write endpoints (`/config/save`, `/reset`, `/metrics`, `/update`, `/ota/check`) use HTTP Basic auth — user `admin`, password from the `/config` **Admin password** field, falling back to `OTA_PASSWORD`.
+
+Four ways to get new firmware onto a board, in order of how much setup each needs: `pio run -t upload` over USB, `pio run -e esp12e_ota -t upload` over ArduinoOTA, the upload form on `/config`, or a **Firmware URL** that every node pulls from on its own.
 
 ## 3. HiveMQ Cloud
 
