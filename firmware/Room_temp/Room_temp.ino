@@ -813,6 +813,51 @@ const unsigned long OTA_FIRST_CHECK_DELAY = 600000UL;    // 10 min of uptime fir
 unsigned long lastOtaCheckMs = 0;
 char otaStatus[56] = "not checked yet";                  // surfaced on /metrics
 
+// Reads the build number the server is offering, from a small text file
+// alongside the image: <ota_url with .bin swapped for .version>.
+//
+// ESP8266httpUpdate asks the *server* to decide -- it sends the running build
+// in x-ESP8266-version and expects a 304 when it matches. A plain file server
+// has never heard of that header and answers 200 with the whole image every
+// time, which turns the six-hourly check into a reflash-and-reboot loop that
+// never ends. The update host here is a Windows file share, exactly that kind
+// of server, so the decision is made on this side instead: one GET of a few
+// bytes that any static host can serve, and the image is only fetched when the
+// string differs. Any difference counts, so publishing an older build is a
+// working rollback.
+//
+// Returns an empty String when the file cannot be read, and the caller then
+// does nothing -- a missing version file must not fall back to asking the
+// server, or the loop above comes straight back.
+String fetchRemoteVersion() {
+  String url(ota_url);
+  if (url.endsWith(".bin")) url.remove(url.length() - 4);
+  url += ".version";
+
+  WiFiClient client;
+  HTTPClient http;
+  if (!http.begin(client, url)) return String();
+  if (strlen(OTA_HTTP_USER) > 0) http.setAuthorization(OTA_HTTP_USER, OTA_HTTP_PASS);
+  http.setTimeout(8000);
+
+  String body;
+  int code = http.GET();
+  if (code == HTTP_CODE_OK) {
+    body = http.getString();
+    body.trim();
+    // A server that answers 200 with an HTML error page would otherwise hand
+    // back "<!doctype html>..." as the offered version and flash on every check.
+    if (body.length() == 0 || body.length() > 16 || body.indexOf('<') >= 0) {
+      Serial.printf("OTA: version file is not a version string (%u bytes)\n", body.length());
+      body = "";
+    }
+  } else {
+    Serial.printf("OTA: version file HTTP %d at %s\n", code, url.c_str());
+  }
+  http.end();
+  return body;
+}
+
 void checkHttpOTA() {
   if (!ota_url[0])                  { copyStr(otaStatus, "no URL configured", sizeof(otaStatus)); return; }
   if (WiFi.status() != WL_CONNECTED){ copyStr(otaStatus, "skipped: no Wi-Fi", sizeof(otaStatus)); return; }
@@ -833,6 +878,21 @@ void checkHttpOTA() {
   oledMsg("Firmware", "Checking...");
   pumpLoops();
 
+  String offered = fetchRemoteVersion();
+  if (offered.length() == 0) {
+    copyStr(otaStatus, "no .version file next to the .bin", sizeof(otaStatus));
+    Serial.println("OTA: no readable .version file - not fetching the image");
+    return;
+  }
+  if (offered == FW_VERSION) {
+    snprintf(otaStatus, sizeof(otaStatus), "up to date (%s)", offered.c_str());
+    Serial.printf("OTA: server offers %s, already running it\n", offered.c_str());
+    return;
+  }
+  Serial.printf("OTA: server offers %s, fetching the image\n", offered.c_str());
+  oledMsg("Firmware", "Updating...", offered);
+  pumpLoops();
+
   WiFiClient client;
   // No setLedPin() here: LED_BUILTIN is GPIO2, which is the DHT data line on
   // this wiring -- blinking it would drive the sensor bus during the download.
@@ -842,19 +902,22 @@ void checkHttpOTA() {
   t_httpUpdate_return ret = ESPhttpUpdate.update(client, String(ota_url), FW_VERSION);
   switch (ret) {
     case HTTP_UPDATE_OK:
-      copyStr(otaStatus, "updated, rebooting", sizeof(otaStatus));
+      snprintf(otaStatus, sizeof(otaStatus), "updated to %s, rebooting", offered.c_str());
       Serial.println("OTA: updated, rebooting");
       oledMsg("Firmware", "Updated", "Rebooting...");
       goOffline("http ota");
       ESP.restart();
       break;
     case HTTP_UPDATE_NO_UPDATES:
-      copyStr(otaStatus, "up to date", sizeof(otaStatus));
-      Serial.println("OTA: already up to date");
+      // The .version file said otherwise, so the server does honour
+      // x-ESP8266-version and the two disagree -- most likely a stale
+      // .version left behind after the image was replaced.
+      snprintf(otaStatus, sizeof(otaStatus), "%s offered, server sent none", offered.c_str());
+      Serial.println("OTA: server answered 304 despite the .version file");
       break;
     case HTTP_UPDATE_FAILED:
     default:
-      snprintf(otaStatus, sizeof(otaStatus), "failed (%d)", ESPhttpUpdate.getLastError());
+      snprintf(otaStatus, sizeof(otaStatus), "%s failed (%d)", offered.c_str(), ESPhttpUpdate.getLastError());
       Serial.printf("OTA: failed (%d) %s\n", ESPhttpUpdate.getLastError(),
                     ESPhttpUpdate.getLastErrorString().c_str());
       break;
@@ -1004,7 +1067,10 @@ void handleConfigPage() {
   html += F("<form method='post' action='/ota/check'><div class='actions'>"
             "<button type='submit' onclick=\"return confirm('Check the firmware URL now?')\">Check firmware URL now</button>"
             "</div></form>");
-  html += F("<small>The pull check also runs on its own after 10 min of uptime, then every 6 h.</small>");
+  html += F("<small>The check also runs on its own after 10 min of uptime, then every 6 h. "
+            "It reads <code>firmware.version</code> next to the .bin (a text file holding just the "
+            "build number) and only downloads the image when that differs from the build running "
+            "here — without that file nothing is fetched.</small>");
   html += F("</div></main></body></html>");
   server.send(200, "text/html", html);
 }
